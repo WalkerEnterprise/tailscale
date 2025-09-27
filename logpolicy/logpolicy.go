@@ -9,7 +9,6 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -52,7 +51,8 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -66,7 +66,7 @@ var getLogTargetOnce struct {
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
 		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = syspolicy.GetString(syspolicy.LogTarget, envTarget)
+		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
 	})
 
 	return getLogTargetOnce.v
@@ -225,6 +225,9 @@ func LogsDir(logf logger.Logf) string {
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
+		if distro.Get() == distro.JetKVM {
+			return "/userdata/tailscale/var"
+		}
 		// STATE_DIRECTORY is set by systemd 240+ but we support older
 		// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
 		systemdStateDir := os.Getenv("STATE_DIRECTORY")
@@ -455,18 +458,6 @@ func tryFixLogStateLocation(dir, cmdname string, logf logger.Logf) {
 func New(collection string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
 	return Options{
 		Collection: collection,
-		NetMon:     netMon,
-		Health:     health,
-		Logf:       logf,
-	}.New()
-}
-
-// Deprecated: Use [Options.New] instead.
-func NewWithConfigPath(collection, dir, cmdName string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
-	return Options{
-		Collection: collection,
-		Dir:        dir,
-		CmdName:    cmdName,
 		NetMon:     netMon,
 		Health:     health,
 		Logf:       logf,
@@ -865,7 +856,7 @@ type TransportOptions struct {
 // New returns an HTTP Transport particularly suited to uploading logs
 // to the given host name. See [DialContext] for details on how it works.
 func (opts TransportOptions) New() http.RoundTripper {
-	if testenv.InTest() {
+	if testenv.InTest() || envknob.NoLogsNoSupport() {
 		return noopPretendSuccessTransport{}
 	}
 	if opts.NetMon == nil {
@@ -911,8 +902,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	host := cmp.Or(opts.Host, logtail.DefaultHost)
-	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(opts.Health, tr.TLSClientConfig)
 	// Force TLS 1.3 since we know log.tailscale.com supports it.
 	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 

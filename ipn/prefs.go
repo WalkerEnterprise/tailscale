@@ -5,6 +5,7 @@ package ipn
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,8 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version"
 )
 
@@ -94,6 +96,25 @@ type Prefs struct {
 	ExitNodeID tailcfg.StableNodeID
 	ExitNodeIP netip.Addr
 
+	// AutoExitNode is an optional expression that specifies whether and how
+	// tailscaled should pick an exit node automatically.
+	//
+	// If specified, tailscaled will use an exit node based on the expression,
+	// and will re-evaluate the selection periodically as network conditions,
+	// available exit nodes, or policy settings change. A blackhole route will
+	// be installed to prevent traffic from escaping to the local network until
+	// an exit node is selected. It takes precedence over ExitNodeID and ExitNodeIP.
+	//
+	// If empty, tailscaled will not automatically select an exit node.
+	//
+	// If the specified expression is invalid or unsupported by the client,
+	// it falls back to the behavior of [AnyExitNode].
+	//
+	// As of 2025-07-02, the only supported value is [AnyExitNode].
+	// It's a string rather than a boolean to allow future extensibility
+	// (e.g., AutoExitNode = "mullvad" or AutoExitNode = "geo:us").
+	AutoExitNode ExitNodeExpression `json:",omitempty"`
+
 	// InternalExitNodePrior is the most recently used ExitNodeID in string form. It is set by
 	// the backend on transition from exit node on to off and used by the
 	// backend.
@@ -139,11 +160,10 @@ type Prefs struct {
 	// connections. This overrides tailcfg.Hostinfo's ShieldsUp.
 	ShieldsUp bool
 
-	// AdvertiseTags specifies groups that this node wants to join, for
-	// purposes of ACL enforcement. These can be referenced from the ACL
-	// security policy. Note that advertising a tag doesn't guarantee that
-	// the control server will allow you to take on the rights for that
-	// tag.
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
 	AdvertiseTags []string
 
 	// Hostname is the hostname to use for identifying the node. If
@@ -325,6 +345,7 @@ type MaskedPrefs struct {
 	RouteAllSet               bool                `json:",omitempty"`
 	ExitNodeIDSet             bool                `json:",omitempty"`
 	ExitNodeIPSet             bool                `json:",omitempty"`
+	AutoExitNodeSet           bool                `json:",omitempty"`
 	InternalExitNodePriorSet  bool                `json:",omitempty"` // Internal; can't be set by LocalAPI clients
 	ExitNodeAllowLANAccessSet bool                `json:",omitempty"`
 	CorpDNSSet                bool                `json:",omitempty"`
@@ -533,6 +554,9 @@ func (p *Prefs) pretty(goos string) string {
 	} else if !p.ExitNodeID.IsZero() {
 		fmt.Fprintf(&sb, "exit=%v lan=%t ", p.ExitNodeID, p.ExitNodeAllowLANAccess)
 	}
+	if p.AutoExitNode.IsSet() {
+		fmt.Fprintf(&sb, "auto=%v ", p.AutoExitNode)
+	}
 	if len(p.AdvertiseRoutes) > 0 || goos == "linux" {
 		fmt.Fprintf(&sb, "routes=%v ", p.AdvertiseRoutes)
 	}
@@ -609,6 +633,7 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.RouteAll == p2.RouteAll &&
 		p.ExitNodeID == p2.ExitNodeID &&
 		p.ExitNodeIP == p2.ExitNodeIP &&
+		p.AutoExitNode == p2.AutoExitNode &&
 		p.InternalExitNodePrior == p2.InternalExitNodePrior &&
 		p.ExitNodeAllowLANAccess == p2.ExitNodeAllowLANAccess &&
 		p.CorpDNS == p2.CorpDNS &&
@@ -694,16 +719,16 @@ func NewPrefs() *Prefs {
 //
 // If not configured, or if the configured value is a legacy name equivalent to
 // the default, then DefaultControlURL is returned instead.
-func (p PrefsView) ControlURLOrDefault() string {
-	return p.ж.ControlURLOrDefault()
+func (p PrefsView) ControlURLOrDefault(polc policyclient.Client) string {
+	return p.ж.ControlURLOrDefault(polc)
 }
 
 // ControlURLOrDefault returns the coordination server's URL base.
 //
 // If not configured, or if the configured value is a legacy name equivalent to
 // the default, then DefaultControlURL is returned instead.
-func (p *Prefs) ControlURLOrDefault() string {
-	controlURL, err := syspolicy.GetString(syspolicy.ControlURL, p.ControlURL)
+func (p *Prefs) ControlURLOrDefault(polc policyclient.Client) string {
+	controlURL, err := polc.GetString(pkey.ControlURL, p.ControlURL)
 	if err != nil {
 		controlURL = p.ControlURL
 	}
@@ -721,9 +746,10 @@ func (p *Prefs) ControlURLOrDefault() string {
 // of the platform it's running on.
 func (p *Prefs) DefaultRouteAll(goos string) bool {
 	switch goos {
-	case "windows":
+	case "windows", "android", "ios":
 		return true
 	case "darwin":
+		// Only true for macAppStore and macsys, false for darwin tailscaled.
 		return version.IsSandboxedMacOS()
 	default:
 		return false
@@ -731,11 +757,11 @@ func (p *Prefs) DefaultRouteAll(goos string) bool {
 }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
-func (p PrefsView) AdminPageURL() string { return p.ж.AdminPageURL() }
+func (p PrefsView) AdminPageURL(polc policyclient.Client) string { return p.ж.AdminPageURL(polc) }
 
 // AdminPageURL returns the admin web site URL for the current ControlURL.
-func (p *Prefs) AdminPageURL() string {
-	url := p.ControlURLOrDefault()
+func (p *Prefs) AdminPageURL(polc policyclient.Client) string {
+	url := p.ControlURLOrDefault(polc)
 	if IsLoginServerSynonym(url) {
 		// TODO(crawshaw): In future release, make this https://console.tailscale.com
 		url = "https://login.tailscale.com"
@@ -803,6 +829,7 @@ func isRemoteIP(st *ipnstate.Status, ip netip.Addr) bool {
 func (p *Prefs) ClearExitNode() {
 	p.ExitNodeID = ""
 	p.ExitNodeIP = netip.Addr{}
+	p.AutoExitNode = ""
 }
 
 // ExitNodeLocalIPError is returned when the requested IP address for an exit
@@ -821,6 +848,9 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 	}
 	ip, err = netip.ParseAddr(s)
 	if err == nil {
+		if !isRemoteIP(st, ip) {
+			return ip, ExitNodeLocalIPError{s}
+		}
 		// If we're online already and have a netmap, double check that the IP
 		// address specified is valid.
 		if st.BackendState == "Running" {
@@ -831,9 +861,6 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 			if !ps.ExitNodeOption {
 				return ip, fmt.Errorf("node %v is not advertising an exit node", ip)
 			}
-		}
-		if !isRemoteIP(st, ip) {
-			return ip, ExitNodeLocalIPError{s}
 		}
 		return ip, nil
 	}
@@ -962,6 +989,7 @@ type WindowsUserID string
 type NetworkProfile struct {
 	MagicDNSName string
 	DomainName   string
+	DisplayName  string
 }
 
 // RequiresBackfill returns whether this object does not have all the data
@@ -972,6 +1000,13 @@ type NetworkProfile struct {
 // do more explicit checks to return whether it's apt for a backfill or not.
 func (n NetworkProfile) RequiresBackfill() bool {
 	return n == NetworkProfile{}
+}
+
+// DisplayNameOrDefault will always return a non-empty string.
+// If there is a defined display name, it will return that.
+// If they did not it will default to their domain name.
+func (n NetworkProfile) DisplayNameOrDefault() string {
+	return cmp.Or(n.DisplayName, n.DomainName)
 }
 
 // LoginProfile represents a single login profile as managed
@@ -1041,4 +1076,46 @@ func (p *LoginProfile) Equals(p2 *LoginProfile) bool {
 		p.NodeID == p2.NodeID &&
 		p.LocalUserID == p2.LocalUserID &&
 		p.ControlURL == p2.ControlURL
+}
+
+// ExitNodeExpression is a string that specifies how an exit node
+// should be selected. An empty string means that no exit node
+// should be selected.
+//
+// As of 2025-07-02, the only supported value is [AnyExitNode].
+type ExitNodeExpression string
+
+// AnyExitNode indicates that the exit node should be automatically
+// selected from the pool of available exit nodes, excluding any
+// disallowed by policy (e.g., [syspolicy.AllowedSuggestedExitNodes]).
+// The exact implementation is subject to change, but exit nodes
+// offering the best performance will be preferred.
+const AnyExitNode ExitNodeExpression = "any"
+
+// IsSet reports whether the expression is non-empty and can be used
+// to select an exit node.
+func (e ExitNodeExpression) IsSet() bool {
+	return e != ""
+}
+
+const (
+	// AutoExitNodePrefix is the prefix used in [syspolicy.ExitNodeID] values and CLI
+	// to indicate that the string following the prefix is an [ipn.ExitNodeExpression].
+	AutoExitNodePrefix = "auto:"
+)
+
+// ParseAutoExitNodeString attempts to parse the given string
+// as an [ExitNodeExpression].
+//
+// It returns the parsed expression and true on success,
+// or an empty string and false if the input does not appear to be
+// an [ExitNodeExpression] (i.e., it doesn't start with "auto:").
+//
+// It is mainly used to parse the [syspolicy.ExitNodeID] value
+// when it is set to "auto:<expression>" (e.g., auto:any).
+func ParseAutoExitNodeString[T ~string](s T) (_ ExitNodeExpression, ok bool) {
+	if expr, ok := strings.CutPrefix(string(s), AutoExitNodePrefix); ok && expr != "" {
+		return ExitNodeExpression(expr), true
+	}
+	return "", false
 }

@@ -34,8 +34,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/client/local"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
@@ -297,14 +296,14 @@ func exe() string {
 func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *tailcfg.DERPMap) {
 	t.Helper()
 
-	d := derp.NewServer(key.NewNode(), logf)
+	d := derpserver.New(key.NewNode(), logf)
 
 	ln, err := net.Listen("tcp", net.JoinHostPort(ipAddress, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
 	httpsrv.Listener.Close()
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -480,11 +479,13 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // TestEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type TestEnv struct {
-	t            testing.TB
-	tunMode      bool
-	cli          string
-	daemon       string
-	loopbackPort *int
+	t                      testing.TB
+	tunMode                bool
+	cli                    string
+	daemon                 string
+	loopbackPort           *int
+	neverDirectUDP         bool
+	relayServerUseLoopback bool
 
 	LogCatcher       *LogCatcher
 	LogCatcherServer *httptest.Server
@@ -569,11 +570,12 @@ type TestNode struct {
 	env              *TestEnv
 	tailscaledParser *nodeOutputParser
 
-	dir        string // temp dir for sock & state
-	configFile string // or empty for none
-	sockFile   string
-	stateFile  string
-	upFlagGOOS string // if non-empty, sets TS_DEBUG_UP_FLAG_GOOS for cmd/tailscale CLI
+	dir          string // temp dir for sock & state
+	configFile   string // or empty for none
+	sockFile     string
+	stateFile    string
+	upFlagGOOS   string // if non-empty, sets TS_DEBUG_UP_FLAG_GOOS for cmd/tailscale CLI
+	encryptState bool
 
 	mu        sync.Mutex
 	onLogLine []func([]byte)
@@ -640,7 +642,7 @@ func (n *TestNode) diskPrefs() *ipn.Prefs {
 	if _, err := os.ReadFile(n.stateFile); err != nil {
 		t.Fatalf("reading prefs: %v", err)
 	}
-	fs, err := store.NewFileStore(nil, n.stateFile)
+	fs, err := store.New(nil, n.stateFile)
 	if err != nil {
 		t.Fatalf("reading prefs, NewFileStore: %v", err)
 	}
@@ -822,6 +824,9 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if n.configFile != "" {
 		cmd.Args = append(cmd.Args, "--config="+n.configFile)
 	}
+	if n.encryptState {
+		cmd.Args = append(cmd.Args, "--encrypt-state")
+	}
 	cmd.Env = append(os.Environ(),
 		"TS_DEBUG_PERMIT_HTTP_C2N=1",
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
@@ -837,6 +842,12 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	)
 	if n.env.loopbackPort != nil {
 		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
+	}
+	if n.env.neverDirectUDP {
+		cmd.Env = append(cmd.Env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
+	}
+	if n.env.relayServerUseLoopback {
+		cmd.Env = append(cmd.Env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
 	}
 	if version.IsRace() {
 		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")

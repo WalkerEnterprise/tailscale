@@ -21,6 +21,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 )
 
 var debug = envknob.RegisterBool("TS_DEBUG_PROFILES")
@@ -705,7 +706,6 @@ var errProfileAccessDenied = errors.New("profile access denied")
 // This is useful for deleting the last profile. In other cases, it is
 // recommended to call [profileManager.SwitchProfile] first.
 func (pm *profileManager) DeleteProfile(id ipn.ProfileID) error {
-	metricDeleteProfile.Add(1)
 	if id == pm.currentProfile.ID() {
 		return pm.deleteCurrentProfile()
 	}
@@ -741,6 +741,7 @@ func (pm *profileManager) deleteProfileNoPermCheck(profile ipn.LoginProfileView)
 		return err
 	}
 	delete(pm.knownProfiles, profile.ID())
+	metricDeleteProfile.Add(1)
 	return pm.writeKnownProfiles()
 }
 
@@ -781,6 +782,7 @@ func (pm *profileManager) writeKnownProfiles() error {
 	if err != nil {
 		return err
 	}
+	metricProfileCount.Set(int64(len(pm.knownProfiles)))
 	return pm.WriteState(ipn.KnownProfilesStateKey, b)
 }
 
@@ -837,7 +839,9 @@ func (pm *profileManager) CurrentPrefs() ipn.PrefsView {
 
 // ReadStartupPrefsForTest reads the startup prefs from disk. It is only used for testing.
 func ReadStartupPrefsForTest(logf logger.Logf, store ipn.StateStore) (ipn.PrefsView, error) {
-	ht := new(health.Tracker) // in tests, don't care about the health status
+	bus := eventbus.New()
+	defer bus.Close()
+	ht := health.NewTracker(bus) // in tests, don't care about the health status
 	pm, err := newProfileManager(store, logf, ht)
 	if err != nil {
 		return ipn.PrefsView{}, err
@@ -892,6 +896,8 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, ht *healt
 	if err != nil {
 		return nil, err
 	}
+
+	metricProfileCount.Set(int64(len(knownProfiles)))
 
 	pm := &profileManager{
 		goos:          goos,
@@ -961,6 +967,7 @@ var (
 	metricSwitchProfile    = clientmetric.NewCounter("profiles_switch")
 	metricDeleteProfile    = clientmetric.NewCounter("profiles_delete")
 	metricDeleteAllProfile = clientmetric.NewCounter("profiles_delete_all")
+	metricProfileCount     = clientmetric.NewGauge("profiles_count")
 
 	metricMigration        = clientmetric.NewCounter("profiles_migration")
 	metricMigrationError   = clientmetric.NewCounter("profiles_migration_error")

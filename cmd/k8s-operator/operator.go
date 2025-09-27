@@ -26,7 +26,10 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -39,7 +42,10 @@ import (
 	kzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"tailscale.com/envknob"
+
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
@@ -51,6 +57,7 @@ import (
 	"tailscale.com/tsnet"
 	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/set"
 	"tailscale.com/version"
 )
 
@@ -72,11 +79,14 @@ func main() {
 		tsNamespace           = defaultEnv("OPERATOR_NAMESPACE", "")
 		tslogging             = defaultEnv("OPERATOR_LOGGING", "info")
 		image                 = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
+		k8sProxyImage         = defaultEnv("K8S_PROXY_IMAGE", "tailscale/k8s-proxy:latest")
 		priorityClassName     = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags                  = defaultEnv("PROXY_TAGS", "tag:k8s")
 		tsFirewallMode        = defaultEnv("PROXY_FIREWALL_MODE", "")
 		defaultProxyClass     = defaultEnv("PROXY_DEFAULT_CLASS", "")
 		isDefaultLoadBalancer = defaultBool("OPERATOR_DEFAULT_LOAD_BALANCER", false)
+		loginServer           = strings.TrimSuffix(defaultEnv("OPERATOR_LOGIN_SERVER", ""), "/")
+		ingressClassName      = defaultEnv("OPERATOR_INGRESS_CLASS_NAME", "tailscale")
 	)
 
 	var opts []kzap.Opts
@@ -103,17 +113,35 @@ func main() {
 	// The operator can run either as a plain operator or it can
 	// additionally act as api-server proxy
 	// https://tailscale.com/kb/1236/kubernetes-operator/?q=kubernetes#accessing-the-kubernetes-control-plane-using-an-api-server-proxy.
-	mode := apiproxy.ParseAPIProxyMode()
-	if mode == apiproxy.APIServerProxyModeDisabled {
+	mode := parseAPIProxyMode()
+	if mode == nil {
 		hostinfo.SetApp(kubetypes.AppOperator)
 	} else {
-		hostinfo.SetApp(kubetypes.AppAPIServerProxy)
+		hostinfo.SetApp(kubetypes.AppInProcessAPIServerProxy)
 	}
 
-	s, tsc := initTSNet(zlog)
+	s, tsc := initTSNet(zlog, loginServer)
 	defer s.Close()
 	restConfig := config.GetConfigOrDie()
-	apiproxy.MaybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
+	if mode != nil {
+		ap, err := apiproxy.NewAPIServerProxy(zlog, restConfig, s, *mode, true)
+		if err != nil {
+			zlog.Fatalf("error creating API server proxy: %v", err)
+		}
+		go func() {
+			if err := ap.Run(context.Background()); err != nil {
+				zlog.Fatalf("error running API server proxy: %v", err)
+			}
+		}()
+	}
+
+	// Operator log uploads can be opted-out using the "TS_NO_LOGS_NO_SUPPORT" environment variable.
+	if !envknob.NoLogsNoSupport() {
+		zlog = zlog.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return wrapZapCore(core, s.LogtailWriter())
+		}))
+	}
+
 	rOpts := reconcilerOpts{
 		log:                           zlog,
 		tsServer:                      s,
@@ -121,11 +149,14 @@ func main() {
 		tailscaleNamespace:            tsNamespace,
 		restConfig:                    restConfig,
 		proxyImage:                    image,
+		k8sProxyImage:                 k8sProxyImage,
 		proxyPriorityClassName:        priorityClassName,
 		proxyActAsDefaultLoadBalancer: isDefaultLoadBalancer,
 		proxyTags:                     tags,
 		proxyFirewallMode:             tsFirewallMode,
 		defaultProxyClass:             defaultProxyClass,
+		loginServer:                   loginServer,
+		ingressClassName:              ingressClassName,
 	}
 	runReconcilers(rOpts)
 }
@@ -133,7 +164,7 @@ func main() {
 // initTSNet initializes the tsnet.Server and logs in to Tailscale. It uses the
 // CLIENT_ID_FILE and CLIENT_SECRET_FILE environment variables to authenticate
 // with Tailscale.
-func initTSNet(zlog *zap.SugaredLogger) (*tsnet.Server, tsClient) {
+func initTSNet(zlog *zap.SugaredLogger, loginServer string) (*tsnet.Server, tsClient) {
 	var (
 		clientIDPath     = defaultEnv("CLIENT_ID_FILE", "")
 		clientSecretPath = defaultEnv("CLIENT_SECRET_FILE", "")
@@ -145,13 +176,14 @@ func initTSNet(zlog *zap.SugaredLogger) (*tsnet.Server, tsClient) {
 	if clientIDPath == "" || clientSecretPath == "" {
 		startlog.Fatalf("CLIENT_ID_FILE and CLIENT_SECRET_FILE must be set")
 	}
-	tsc, err := newTSClient(context.Background(), clientIDPath, clientSecretPath)
+	tsc, err := newTSClient(context.Background(), clientIDPath, clientSecretPath, loginServer)
 	if err != nil {
 		startlog.Fatalf("error creating Tailscale client: %v", err)
 	}
 	s := &tsnet.Server{
-		Hostname: hostname,
-		Logf:     zlog.Named("tailscaled").Debugf,
+		Hostname:   hostname,
+		Logf:       zlog.Named("tailscaled").Debugf,
+		ControlURL: loginServer,
 	}
 	if p := os.Getenv("TS_PORT"); p != "" {
 		port, err := strconv.ParseUint(p, 10, 16)
@@ -228,6 +260,17 @@ waitOnline:
 	return s, tsc
 }
 
+// predicate function for filtering to ensure we *don't* reconcile on tailscale managed Kubernetes Services
+func serviceManagedResourceFilterPredicate() predicate.Predicate {
+	return predicate.NewPredicateFuncs(func(object client.Object) bool {
+		if svc, ok := object.(*corev1.Service); !ok {
+			return false
+		} else {
+			return !isManagedResource(svc)
+		}
+	})
+}
+
 // runReconcilers starts the controller-runtime manager and registers the
 // ServiceReconciler. It blocks forever.
 func runReconcilers(opts reconcilerOpts) {
@@ -241,6 +284,7 @@ func runReconcilers(opts reconcilerOpts) {
 	nsFilter := cache.ByObject{
 		Field: client.InNamespace(opts.tailscaleNamespace).AsSelector(),
 	}
+
 	// We watch the ServiceMonitor CRD to ensure that reconcilers are re-triggered if user's workflows result in the
 	// ServiceMonitor CRD applied after some of our resources that define ServiceMonitor creation. This selector
 	// ensures that we only watch the ServiceMonitor CRD and that we don't cache full contents of it.
@@ -248,10 +292,13 @@ func runReconcilers(opts reconcilerOpts) {
 		Field:     fields.SelectorFromSet(fields.Set{"metadata.name": serviceMonitorCRD}),
 		Transform: crdTransformer(startlog),
 	}
+
+	// TODO (irbekrm): stricter filtering what we watch/cache/call
+	// reconcilers on. c/r by default starts a watch on any
+	// resources that we GET via the controller manager's client.
 	mgrOpts := manager.Options{
-		// TODO (irbekrm): stricter filtering what we watch/cache/call
-		// reconcilers on. c/r by default starts a watch on any
-		// resources that we GET via the controller manager's client.
+		// The cache will apply the specified filters only to the object types listed below via ByObject.
+		// Other object types (e.g., EndpointSlices) can still be fetched or watched using the cached client, but they will not have any filtering applied.
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Secret{}:                            nsFilter,
@@ -260,7 +307,6 @@ func runReconcilers(opts reconcilerOpts) {
 				&corev1.ConfigMap{}:                         nsFilter,
 				&appsv1.StatefulSet{}:                       nsFilter,
 				&appsv1.Deployment{}:                        nsFilter,
-				&discoveryv1.EndpointSlice{}:                nsFilter,
 				&rbacv1.Role{}:                              nsFilter,
 				&rbacv1.RoleBinding{}:                       nsFilter,
 				&apiextensionsv1.CustomResourceDefinition{}: serviceMonitorSelector,
@@ -289,7 +335,9 @@ func runReconcilers(opts reconcilerOpts) {
 		proxyImage:             opts.proxyImage,
 		proxyPriorityClassName: opts.proxyPriorityClassName,
 		tsFirewallMode:         opts.proxyFirewallMode,
+		loginServer:            opts.tsServer.ControlURL,
 	}
+
 	err = builder.
 		ControllerManagedBy(mgr).
 		Named("service-reconciler").
@@ -310,12 +358,16 @@ func runReconcilers(opts reconcilerOpts) {
 	if err != nil {
 		startlog.Fatalf("could not create service reconciler: %v", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(corev1.Service), indexServiceProxyClass, indexProxyClass); err != nil {
+		startlog.Fatalf("failed setting up ProxyClass indexer for Services: %v", err)
+	}
+
 	ingressChildFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("ingress"))
 	// If a ProxyClassChanges, enqueue all Ingresses labeled with that
 	// ProxyClass's name.
 	proxyClassFilterForIngress := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForIngress(mgr.GetClient(), startlog))
 	// Enque Ingress if a managed Service or backend Service associated with a tailscale Ingress changes.
-	svcHandlerForIngress := handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngress(mgr.GetClient(), startlog))
+	svcHandlerForIngress := handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngress(mgr.GetClient(), startlog, opts.ingressClassName))
 	err = builder.
 		ControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
@@ -330,10 +382,15 @@ func runReconcilers(opts reconcilerOpts) {
 			Client:            mgr.GetClient(),
 			logger:            opts.log.Named("ingress-reconciler"),
 			defaultProxyClass: opts.defaultProxyClass,
+			ingressClassName:  opts.ingressClassName,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ingress reconciler: %v", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(networkingv1.Ingress), indexIngressProxyClass, indexProxyClass); err != nil {
+		startlog.Fatalf("failed setting up ProxyClass indexer for Ingresses: %v", err)
+	}
+
 	lc, err := opts.tsServer.LocalClient()
 	if err != nil {
 		startlog.Fatalf("could not get local client: %v", err)
@@ -347,25 +404,52 @@ func runReconcilers(opts reconcilerOpts) {
 		ControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
 		Named("ingress-pg-reconciler").
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog))).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog, opts.ingressClassName))).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(HAIngressesFromSecret(mgr.GetClient(), startlog))).
 		Watches(&tsapi.ProxyGroup{}, ingressProxyGroupFilter).
 		Complete(&HAIngressReconciler{
-			recorder:    eventRecorder,
-			tsClient:    opts.tsClient,
-			tsnetServer: opts.tsServer,
-			defaultTags: strings.Split(opts.proxyTags, ","),
-			Client:      mgr.GetClient(),
-			logger:      opts.log.Named("ingress-pg-reconciler"),
-			lc:          lc,
-			operatorID:  id,
-			tsNamespace: opts.tailscaleNamespace,
+			recorder:         eventRecorder,
+			tsClient:         opts.tsClient,
+			tsnetServer:      opts.tsServer,
+			defaultTags:      strings.Split(opts.proxyTags, ","),
+			Client:           mgr.GetClient(),
+			logger:           opts.log.Named("ingress-pg-reconciler"),
+			lc:               lc,
+			operatorID:       id,
+			tsNamespace:      opts.tailscaleNamespace,
+			ingressClassName: opts.ingressClassName,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ingress-pg-reconciler: %v", err)
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(networkingv1.Ingress), indexIngressProxyGroup, indexPGIngresses); err != nil {
 		startlog.Fatalf("failed setting up indexer for HA Ingresses: %v", err)
+	}
+
+	ingressSvcFromEpsFilter := handler.EnqueueRequestsFromMapFunc(ingressSvcFromEps(mgr.GetClient(), opts.log.Named("service-pg-reconciler")))
+	err = builder.
+		ControllerManagedBy(mgr).
+		For(&corev1.Service{}, builder.WithPredicates(serviceManagedResourceFilterPredicate())).
+		Named("service-pg-reconciler").
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(HAServicesFromSecret(mgr.GetClient(), startlog))).
+		Watches(&tsapi.ProxyGroup{}, ingressProxyGroupFilter).
+		Watches(&discoveryv1.EndpointSlice{}, ingressSvcFromEpsFilter).
+		Complete(&HAServiceReconciler{
+			recorder:    eventRecorder,
+			tsClient:    opts.tsClient,
+			defaultTags: strings.Split(opts.proxyTags, ","),
+			Client:      mgr.GetClient(),
+			logger:      opts.log.Named("service-pg-reconciler"),
+			lc:          lc,
+			clock:       tstime.DefaultClock{},
+			operatorID:  id,
+			tsNamespace: opts.tailscaleNamespace,
+		})
+	if err != nil {
+		startlog.Fatalf("could not create service-pg-reconciler: %v", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(corev1.Service), indexIngressProxyGroup, indexPGIngresses); err != nil {
+		startlog.Fatalf("failed setting up indexer for HA Services: %v", err)
 	}
 
 	connectorFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("connector"))
@@ -489,16 +573,19 @@ func runReconcilers(opts reconcilerOpts) {
 	// ProxyClass reconciler gets triggered on ServiceMonitor CRD changes to ensure that any ProxyClasses, that
 	// define that a ServiceMonitor should be created, were set to invalid because the CRD did not exist get
 	// reconciled if the CRD is applied at a later point.
+	kPortRange := getServicesNodePortRange(context.Background(), mgr.GetClient(), opts.tailscaleNamespace, startlog)
 	serviceMonitorFilter := handler.EnqueueRequestsFromMapFunc(proxyClassesWithServiceMonitor(mgr.GetClient(), opts.log))
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.ProxyClass{}).
 		Named("proxyclass-reconciler").
 		Watches(&apiextensionsv1.CustomResourceDefinition{}, serviceMonitorFilter).
 		Complete(&ProxyClassReconciler{
-			Client:   mgr.GetClient(),
-			recorder: eventRecorder,
-			logger:   opts.log.Named("proxyclass-reconciler"),
-			clock:    tstime.DefaultClock{},
+			Client:        mgr.GetClient(),
+			nodePortRange: kPortRange,
+			recorder:      eventRecorder,
+			tsNamespace:   opts.tailscaleNamespace,
+			logger:        opts.log.Named("proxyclass-reconciler"),
+			clock:         tstime.DefaultClock{},
 		})
 	if err != nil {
 		startlog.Fatal("could not create proxyclass reconciler: %v", err)
@@ -549,24 +636,55 @@ func runReconcilers(opts reconcilerOpts) {
 			l:           opts.log.Named("recorder-reconciler"),
 			clock:       tstime.DefaultClock{},
 			tsClient:    opts.tsClient,
+			loginServer: opts.loginServer,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create Recorder reconciler: %v", err)
 	}
 
+	// kube-apiserver's Tailscale Service reconciler.
+	err = builder.
+		ControllerManagedBy(mgr).
+		For(&tsapi.ProxyGroup{}, builder.WithPredicates(
+			predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				pg, ok := obj.(*tsapi.ProxyGroup)
+				return ok && pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer
+			}),
+		)).
+		Named("kube-apiserver-ts-service-reconciler").
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(kubeAPIServerPGsFromSecret(mgr.GetClient(), startlog))).
+		Complete(&KubeAPIServerTSServiceReconciler{
+			Client:      mgr.GetClient(),
+			recorder:    eventRecorder,
+			logger:      opts.log.Named("kube-apiserver-ts-service-reconciler"),
+			tsClient:    opts.tsClient,
+			tsNamespace: opts.tailscaleNamespace,
+			lc:          lc,
+			defaultTags: strings.Split(opts.proxyTags, ","),
+			operatorID:  id,
+			clock:       tstime.DefaultClock{},
+		})
+	if err != nil {
+		startlog.Fatalf("could not create Kubernetes API server Tailscale Service reconciler: %v", err)
+	}
+
 	// ProxyGroup reconciler.
 	ownedByProxyGroupFilter := handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &tsapi.ProxyGroup{})
 	proxyClassFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForProxyGroup(mgr.GetClient(), startlog))
+	nodeFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(nodeHandlerForProxyGroup(mgr.GetClient(), opts.defaultProxyClass, startlog))
+	saFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(serviceAccountHandlerForProxyGroup(mgr.GetClient(), startlog))
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.ProxyGroup{}).
 		Named("proxygroup-reconciler").
+		Watches(&corev1.Service{}, ownedByProxyGroupFilter).
 		Watches(&appsv1.StatefulSet{}, ownedByProxyGroupFilter).
 		Watches(&corev1.ConfigMap{}, ownedByProxyGroupFilter).
-		Watches(&corev1.ServiceAccount{}, ownedByProxyGroupFilter).
+		Watches(&corev1.ServiceAccount{}, saFilterForProxyGroup).
 		Watches(&corev1.Secret{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.Role{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.RoleBinding{}, ownedByProxyGroupFilter).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForProxyGroup).
+		Watches(&corev1.Node{}, nodeFilterForProxyGroup).
 		Complete(&ProxyGroupReconciler{
 			recorder: eventRecorder,
 			Client:   mgr.GetClient(),
@@ -575,10 +693,12 @@ func runReconcilers(opts reconcilerOpts) {
 			tsClient: opts.tsClient,
 
 			tsNamespace:       opts.tailscaleNamespace,
-			proxyImage:        opts.proxyImage,
+			tsProxyImage:      opts.proxyImage,
+			k8sProxyImage:     opts.k8sProxyImage,
 			defaultTags:       strings.Split(opts.proxyTags, ","),
 			tsFirewallMode:    opts.proxyFirewallMode,
 			defaultProxyClass: opts.defaultProxyClass,
+			loginServer:       opts.tsServer.ControlURL,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ProxyGroup reconciler: %v", err)
@@ -597,6 +717,7 @@ type reconcilerOpts struct {
 	tailscaleNamespace string       // namespace in which operator resources will be deployed
 	restConfig         *rest.Config // config for connecting to the kube API server
 	proxyImage         string       // <proxy-image-repo>:<proxy-image-tag>
+	k8sProxyImage      string       // <k8s-proxy-image-repo>:<k8s-proxy-image-tag>
 	// proxyPriorityClassName isPriorityClass to be set for proxy Pods. This
 	// is a legacy mechanism for cluster resource configuration options -
 	// going forward use ProxyClass.
@@ -628,6 +749,11 @@ type reconcilerOpts struct {
 	// class for proxies that do not have a ProxyClass set.
 	// this is defined by an operator env variable.
 	defaultProxyClass string
+	// loginServer is the coordination server URL that should be used by managed resources.
+	loginServer string
+	// ingressClassName is the name of the ingress class used by reconcilers of Ingress resources. This defaults
+	// to "tailscale" but can be customised.
+	ingressClassName string
 }
 
 // enqueueAllIngressEgressProxySvcsinNS returns a reconcile request for each
@@ -747,6 +873,16 @@ func managedResourceHandlerForType(typ string) handler.MapFunc {
 	}
 }
 
+// indexProxyClass is used to select ProxyClass-backed objects which are
+// locally indexed in the cache for efficient listing without requiring labels.
+func indexProxyClass(o client.Object) []string {
+	if !hasProxyClassAnnotation(o) {
+		return nil
+	}
+
+	return []string{o.GetAnnotations()[LabelAnnotationProxyClass]}
+}
+
 // proxyClassHandlerForSvc returns a handler that, for a given ProxyClass,
 // returns a list of reconcile requests for all Services labeled with
 // tailscale.com/proxy-class: <proxy class name>.
@@ -754,16 +890,37 @@ func proxyClassHandlerForSvc(cl client.Client, logger *zap.SugaredLogger) handle
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		svcList := new(corev1.ServiceList)
 		labels := map[string]string{
-			LabelProxyClass: o.GetName(),
+			LabelAnnotationProxyClass: o.GetName(),
 		}
+
 		if err := cl.List(ctx, svcList, client.MatchingLabels(labels)); err != nil {
 			logger.Debugf("error listing Services for ProxyClass: %v", err)
 			return nil
 		}
+
 		reqs := make([]reconcile.Request, 0)
+		seenSvcs := make(set.Set[string])
 		for _, svc := range svcList.Items {
 			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&svc)})
+			seenSvcs.Add(fmt.Sprintf("%s/%s", svc.Namespace, svc.Name))
 		}
+
+		svcAnnotationList := new(corev1.ServiceList)
+		if err := cl.List(ctx, svcAnnotationList, client.MatchingFields{indexServiceProxyClass: o.GetName()}); err != nil {
+			logger.Debugf("error listing Services for ProxyClass: %v", err)
+			return nil
+		}
+
+		for _, svc := range svcAnnotationList.Items {
+			nsname := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
+			if seenSvcs.Contains(nsname) {
+				continue
+			}
+
+			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&svc)})
+			seenSvcs.Add(nsname)
+		}
+
 		return reqs
 	}
 }
@@ -775,16 +932,36 @@ func proxyClassHandlerForIngress(cl client.Client, logger *zap.SugaredLogger) ha
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		ingList := new(networkingv1.IngressList)
 		labels := map[string]string{
-			LabelProxyClass: o.GetName(),
+			LabelAnnotationProxyClass: o.GetName(),
 		}
 		if err := cl.List(ctx, ingList, client.MatchingLabels(labels)); err != nil {
 			logger.Debugf("error listing Ingresses for ProxyClass: %v", err)
 			return nil
 		}
+
 		reqs := make([]reconcile.Request, 0)
+		seenIngs := make(set.Set[string])
 		for _, ing := range ingList.Items {
 			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&ing)})
+			seenIngs.Add(fmt.Sprintf("%s/%s", ing.Namespace, ing.Name))
 		}
+
+		ingAnnotationList := new(networkingv1.IngressList)
+		if err := cl.List(ctx, ingAnnotationList, client.MatchingFields{indexIngressProxyClass: o.GetName()}); err != nil {
+			logger.Debugf("error listing Ingreses for ProxyClass: %v", err)
+			return nil
+		}
+
+		for _, ing := range ingAnnotationList.Items {
+			nsname := fmt.Sprintf("%s/%s", ing.Namespace, ing.Name)
+			if seenIngs.Contains(nsname) {
+				continue
+			}
+
+			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&ing)})
+			seenIngs.Add(nsname)
+		}
+
 		return reqs
 	}
 }
@@ -810,9 +987,67 @@ func proxyClassHandlerForConnector(cl client.Client, logger *zap.SugaredLogger) 
 	}
 }
 
+// nodeHandlerForProxyGroup returns a handler that, for a given Node, returns a
+// list of reconcile requests for ProxyGroups that should be reconciled for the
+// Node event. ProxyGroups need to be reconciled for Node events if they are
+// configured to expose tailscaled static endpoints to tailnet using NodePort
+// Services.
+func nodeHandlerForProxyGroup(cl client.Client, defaultProxyClass string, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		pgList := new(tsapi.ProxyGroupList)
+		if err := cl.List(ctx, pgList); err != nil {
+			logger.Debugf("error listing ProxyGroups for ProxyClass: %v", err)
+			return nil
+		}
+
+		reqs := make([]reconcile.Request, 0)
+		for _, pg := range pgList.Items {
+			if pg.Spec.ProxyClass == "" && defaultProxyClass == "" {
+				continue
+			}
+
+			pc := defaultProxyClass
+			if pc == "" {
+				pc = pg.Spec.ProxyClass
+			}
+
+			proxyClass := &tsapi.ProxyClass{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: pc}, proxyClass); err != nil {
+				logger.Debugf("error getting ProxyClass %q: %v", pg.Spec.ProxyClass, err)
+				return nil
+			}
+
+			stat := proxyClass.Spec.StaticEndpoints
+			if stat == nil {
+				continue
+			}
+
+			// If the selector is empty, all nodes match.
+			// TODO(ChaosInTheCRD): think about how this must be handled if we want to limit the number of nodes used
+			if len(stat.NodePort.Selector) == 0 {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+				continue
+			}
+
+			selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+				MatchLabels: stat.NodePort.Selector,
+			})
+			if err != nil {
+				logger.Debugf("error converting `spec.staticEndpoints.nodePort.selector` to Selector: %v", err)
+				return nil
+			}
+
+			if selector.Matches(klabels.Set(o.GetLabels())) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+			}
+		}
+		return reqs
+	}
+}
+
 // proxyClassHandlerForProxyGroup returns a handler that, for a given ProxyClass,
-// returns a list of reconcile requests for all Connectors that have
-// .spec.proxyClass set.
+// returns a list of reconcile requests for all ProxyGroups that have
+// .spec.proxyClass set to that ProxyClass.
 func proxyClassHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		pgList := new(tsapi.ProxyGroupList)
@@ -831,13 +1066,44 @@ func proxyClassHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger)
 	}
 }
 
+// serviceAccountHandlerForProxyGroup returns a handler that, for a given ServiceAccount,
+// returns a list of reconcile requests for all ProxyGroups that use that ServiceAccount.
+// For most ProxyGroups, this will be a dedicated ServiceAccount owned by a specific
+// ProxyGroup. But for kube-apiserver ProxyGroups running in auth mode, they use a shared
+// static ServiceAccount named "kube-apiserver-auth-proxy".
+func serviceAccountHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		pgList := new(tsapi.ProxyGroupList)
+		if err := cl.List(ctx, pgList); err != nil {
+			logger.Debugf("error listing ProxyGroups for ServiceAccount: %v", err)
+			return nil
+		}
+		reqs := make([]reconcile.Request, 0)
+		saName := o.GetName()
+		for _, pg := range pgList.Items {
+			if saName == authAPIServerProxySAName && isAuthAPIServerProxy(&pg) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+			}
+			expectedOwner := pgOwnerReference(&pg)[0]
+			saOwnerRefs := o.GetOwnerReferences()
+			for _, ref := range saOwnerRefs {
+				if apiequality.Semantic.DeepEqual(ref, expectedOwner) {
+					reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+					break
+				}
+			}
+		}
+		return reqs
+	}
+}
+
 // serviceHandlerForIngress returns a handler for Service events for ingress
 // reconciler that ensures that if the Service associated with an event is of
 // interest to the reconciler, the associated Ingress(es) gets be reconciled.
 // The Services of interest are backend Services for tailscale Ingress and
 // managed Services for an StatefulSet for a proxy configured for tailscale
 // Ingress
-func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger, ingressClassName string) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		if isManagedByType(o, "ingress") {
 			ingName := parentFromObjectLabels(o)
@@ -850,7 +1116,7 @@ func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger) handl
 		}
 		reqs := make([]reconcile.Request, 0)
 		for _, ing := range ingList.Items {
-			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != tailscaleIngressClassName {
+			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != ingressClassName {
 				return nil
 			}
 			if hasProxyGroupAnnotation(&ing) {
@@ -983,7 +1249,7 @@ func egressEpsFromPGStateSecrets(cl client.Client, ns string) handler.MapFunc {
 		if parentType := o.GetLabels()[LabelParentType]; parentType != "proxygroup" {
 			return nil
 		}
-		if secretType := o.GetLabels()[kubetypes.LabelSecretType]; secretType != "state" {
+		if secretType := o.GetLabels()[kubetypes.LabelSecretType]; secretType != kubetypes.LabelSecretTypeState {
 			return nil
 		}
 		pg, ok := o.GetLabels()[LabelParentName]
@@ -991,6 +1257,36 @@ func egressEpsFromPGStateSecrets(cl client.Client, ns string) handler.MapFunc {
 			return nil
 		}
 		return reconcileRequestsForPG(pg, cl, ns)
+	}
+}
+
+func ingressSvcFromEps(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		svcName := o.GetLabels()[discoveryv1.LabelServiceName]
+		if svcName == "" {
+			return nil
+		}
+
+		svc := &corev1.Service{}
+		ns := o.GetNamespace()
+		if err := cl.Get(ctx, types.NamespacedName{Name: svcName, Namespace: ns}, svc); err != nil {
+			logger.Errorf("failed to get service: %v", err)
+			return nil
+		}
+
+		pgName := svc.Annotations[AnnotationProxyGroup]
+		if pgName == "" {
+			return nil
+		}
+
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Namespace: ns,
+					Name:      svcName,
+				},
+			},
+		}
 	}
 }
 
@@ -1043,7 +1339,7 @@ func reconcileRequestsForPG(pg string, cl client.Client, ns string) []reconcile.
 func isTLSSecret(secret *corev1.Secret) bool {
 	return secret.Type == corev1.SecretTypeTLS &&
 		secret.ObjectMeta.Labels[kubetypes.LabelManaged] == "true" &&
-		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == "certs" &&
+		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == kubetypes.LabelSecretTypeCerts &&
 		secret.ObjectMeta.Labels[labelDomain] != "" &&
 		secret.ObjectMeta.Labels[labelProxyGroup] != ""
 }
@@ -1051,7 +1347,7 @@ func isTLSSecret(secret *corev1.Secret) bool {
 func isPGStateSecret(secret *corev1.Secret) bool {
 	return secret.ObjectMeta.Labels[kubetypes.LabelManaged] == "true" &&
 		secret.ObjectMeta.Labels[LabelParentType] == "proxygroup" &&
-		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == "state"
+		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == kubetypes.LabelSecretTypeState
 }
 
 // HAIngressesFromSecret returns a handler that returns reconcile requests for
@@ -1096,6 +1392,76 @@ func HAIngressesFromSecret(cl client.Client, logger *zap.SugaredLogger) handler.
 			})
 		}
 		return reqs
+	}
+}
+
+// HAServiceFromSecret returns a handler that returns reconcile requests for
+// all HA Services that should be reconciled in response to a Secret event.
+func HAServicesFromSecret(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		secret, ok := o.(*corev1.Secret)
+		if !ok {
+			logger.Infof("[unexpected] Secret handler triggered for an object that is not a Secret")
+			return nil
+		}
+		if !isPGStateSecret(secret) {
+			return nil
+		}
+		pgName, ok := secret.ObjectMeta.Labels[LabelParentName]
+		if !ok {
+			return nil
+		}
+		svcList := &corev1.ServiceList{}
+		if err := cl.List(ctx, svcList, client.MatchingFields{indexIngressProxyGroup: pgName}); err != nil {
+			logger.Infof("error listing Services, skipping a reconcile for event on Secret %s: %v", secret.Name, err)
+			return nil
+		}
+		reqs := make([]reconcile.Request, 0)
+		for _, svc := range svcList.Items {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: svc.Namespace,
+					Name:      svc.Name,
+				},
+			})
+		}
+		return reqs
+	}
+}
+
+// kubeAPIServerPGsFromSecret finds ProxyGroups of type "kube-apiserver" that
+// need to be reconciled after a ProxyGroup-owned Secret is updated.
+func kubeAPIServerPGsFromSecret(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		secret, ok := o.(*corev1.Secret)
+		if !ok {
+			logger.Infof("[unexpected] Secret handler triggered for an object that is not a Secret")
+			return nil
+		}
+		if secret.ObjectMeta.Labels[kubetypes.LabelManaged] != "true" ||
+			secret.ObjectMeta.Labels[LabelParentType] != "proxygroup" {
+			return nil
+		}
+
+		var pg tsapi.ProxyGroup
+		if err := cl.Get(ctx, types.NamespacedName{Name: secret.ObjectMeta.Labels[LabelParentName]}, &pg); err != nil {
+			logger.Infof("error getting ProxyGroup %s: %v", secret.ObjectMeta.Labels[LabelParentName], err)
+			return nil
+		}
+
+		if pg.Spec.Type != tsapi.ProxyGroupTypeKubernetesAPIServer {
+			return nil
+		}
+
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Namespace: secret.ObjectMeta.Labels[LabelParentNamespace],
+					Name:      secret.ObjectMeta.Labels[LabelParentName],
+				},
+			},
+		}
+
 	}
 }
 
@@ -1270,7 +1636,7 @@ func crdTransformer(log *zap.SugaredLogger) toolscache.TransformFunc {
 	}
 }
 
-// indexEgressServices adds a local index to a cached Tailscale egress Services meant to be exposed on a ProxyGroup. The
+// indexEgressServices adds a local index to cached Tailscale egress Services meant to be exposed on a ProxyGroup. The
 // index is used a list filter.
 func indexEgressServices(o client.Object) []string {
 	if !isEgressSvcForProxyGroup(o) {
@@ -1279,8 +1645,8 @@ func indexEgressServices(o client.Object) []string {
 	return []string{o.GetAnnotations()[AnnotationProxyGroup]}
 }
 
-// indexPGIngresses adds a local index to a cached Tailscale Ingresses meant to be exposed on a ProxyGroup. The index is
-// used a list filter.
+// indexPGIngresses is used to select ProxyGroup-backed Services which are
+// locally indexed in the cache for efficient listing without requiring labels.
 func indexPGIngresses(o client.Object) []string {
 	if !hasProxyGroupAnnotation(o) {
 		return nil
@@ -1291,7 +1657,7 @@ func indexPGIngresses(o client.Object) []string {
 // serviceHandlerForIngressPG returns a handler for Service events that ensures that if the Service
 // associated with an event is a backend Service for a tailscale Ingress with ProxyGroup annotation,
 // the associated Ingress gets reconciled.
-func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger, ingressClassName string) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		ingList := networkingv1.IngressList{}
 		if err := cl.List(ctx, &ingList, client.InNamespace(o.GetNamespace())); err != nil {
@@ -1300,7 +1666,7 @@ func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) han
 		}
 		reqs := make([]reconcile.Request, 0)
 		for _, ing := range ingList.Items {
-			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != tailscaleIngressClassName {
+			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != ingressClassName {
 				continue
 			}
 			if !hasProxyGroupAnnotation(&ing) {
@@ -1325,8 +1691,11 @@ func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) han
 }
 
 func hasProxyGroupAnnotation(obj client.Object) bool {
-	ing := obj.(*networkingv1.Ingress)
-	return ing.Annotations[AnnotationProxyGroup] != ""
+	return obj.GetAnnotations()[AnnotationProxyGroup] != ""
+}
+
+func hasProxyClassAnnotation(obj client.Object) bool {
+	return obj.GetAnnotations()[LabelAnnotationProxyClass] != ""
 }
 
 func id(ctx context.Context, lc *local.Client) (string, error) {

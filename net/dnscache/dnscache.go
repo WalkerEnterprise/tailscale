@@ -24,6 +24,7 @@ import (
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/testenv"
 )
 
 var zaddr netip.Addr
@@ -62,6 +63,10 @@ type Resolver struct {
 	// Forward is the resolver to use to populate the cache.
 	// If nil, net.DefaultResolver is used.
 	Forward *net.Resolver
+
+	// LookupIPForTest, if non-nil and in tests, handles requests instead
+	// of the usual mechanisms.
+	LookupIPForTest func(ctx context.Context, host string) ([]netip.Addr, error)
 
 	// LookupIPFallback optionally provides a backup DNS mechanism
 	// to use if Forward returns an error or no results.
@@ -200,6 +205,9 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 netip.Addr
 			}
 			allIPs = append(allIPs, naIP)
 		}
+		if !ip.IsValid() && v6.IsValid() {
+			ip = v6
+		}
 		r.dlogf("returning %d static results", len(allIPs))
 		return
 	}
@@ -284,7 +292,13 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, r.lookupTimeoutForHost(host))
 	defer lookupCancel()
-	ips, err := r.fwd().LookupNetIP(lookupCtx, "ip", host)
+
+	var ips []netip.Addr
+	if r.LookupIPForTest != nil && testenv.InTest() {
+		ips, err = r.LookupIPForTest(ctx, host)
+	} else {
+		ips, err = r.fwd().LookupNetIP(lookupCtx, "ip", host)
+	}
 	if err != nil || len(ips) == 0 {
 		if resolver, ok := r.cloudHostResolver(); ok {
 			r.dlogf("resolving %q via cloud resolver", host)

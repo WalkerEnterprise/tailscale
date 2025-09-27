@@ -27,6 +27,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/ipn/store/mem"
@@ -107,8 +108,9 @@ func newIPN(jsConfig js.Value) map[string]any {
 		Dialer:        dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
+		EventBus:      sys.Bus.Get(),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -136,7 +138,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Tun.Get().Start()
 
 	logid := lpc.PublicID
-	srv := ipnserver.New(logf, logid, sys.NetMon.Get())
+	srv := ipnserver.New(logf, logid, sys.Bus.Get(), sys.NetMon.Get())
 	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
 	if err != nil {
 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
@@ -336,7 +338,7 @@ func (i *jsIPN) logout() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		i.lb.Logout(ctx)
+		i.lb.Logout(ctx, ipnauth.Self)
 	}()
 }
 

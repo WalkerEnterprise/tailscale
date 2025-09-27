@@ -41,6 +41,8 @@ const (
 	reasonProxyInvalid = "ProxyInvalid"
 	reasonProxyFailed  = "ProxyFailed"
 	reasonProxyPending = "ProxyPending"
+
+	indexServiceProxyClass = ".metadata.annotations.service-proxy-class"
 )
 
 type ServiceReconciler struct {
@@ -262,12 +264,14 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	}
 
 	sts := &tailscaleSTSConfig{
+		Replicas:            1,
 		ParentResourceName:  svc.Name,
 		ParentResourceUID:   string(svc.UID),
 		Hostname:            nameForService(svc),
 		Tags:                tags,
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
+		LoginServer:         a.ssr.loginServer,
 	}
 	sts.proxyType = proxyTypeEgress
 	if a.shouldExpose(svc) {
@@ -328,11 +332,12 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
+	devices, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
 		return fmt.Errorf("failed to get device ID: %w", err)
 	}
-	if dev == nil || dev.hostname == "" {
+
+	if len(devices) == 0 || devices[0].hostname == "" {
 		msg := "no Tailscale hostname known yet, waiting for proxy pod to finish auth"
 		logger.Debug(msg)
 		// No hostname yet. Wait for the proxy pod to auth.
@@ -341,16 +346,20 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
+	dev := devices[0]
 	logger.Debugf("setting Service LoadBalancer status to %q, %s", dev.hostname, strings.Join(dev.ips, ", "))
+
 	ingress := []corev1.LoadBalancerIngress{
 		{Hostname: dev.hostname},
 	}
+
 	clusterIPAddr, err := netip.ParseAddr(svc.Spec.ClusterIP)
 	if err != nil {
 		msg := fmt.Sprintf("failed to parse cluster IP: %v", err)
 		tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionFalse, reasonProxyFailed, msg, a.clock, logger)
 		return errors.New(msg)
 	}
+
 	for _, ip := range dev.ips {
 		addr, err := netip.ParseAddr(ip)
 		if err != nil {
@@ -360,6 +369,7 @@ func (a *ServiceReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			ingress = append(ingress, corev1.LoadBalancerIngress{IP: ip})
 		}
 	}
+
 	svc.Status.LoadBalancer.Ingress = ingress
 	tsoperator.SetServiceCondition(svc, tsapi.ProxyReady, metav1.ConditionTrue, reasonProxyCreated, reasonProxyCreated, a.clock, logger)
 	return nil
@@ -392,6 +402,7 @@ func validateService(svc *corev1.Service) []string {
 			violations = append(violations, fmt.Sprintf("invalid Tailscale hostname %q, use %q annotation to override: %s", svcName, AnnotationHostname, err))
 		}
 	}
+	violations = append(violations, tagViolations(svc)...)
 	return violations
 }
 
@@ -435,16 +446,6 @@ func tailnetTargetAnnotation(svc *corev1.Service) string {
 		return ip
 	}
 	return svc.Annotations[annotationTailnetTargetIPOld]
-}
-
-// proxyClassForObject returns the proxy class for the given object. If the
-// object does not have a proxy class label, it returns the default proxy class
-func proxyClassForObject(o client.Object, proxyDefaultClass string) string {
-	proxyClass, exists := o.GetLabels()[LabelProxyClass]
-	if !exists {
-		proxyClass = proxyDefaultClass
-	}
-	return proxyClass
 }
 
 func proxyClassIsReady(ctx context.Context, name string, cl client.Client) (bool, error) {

@@ -7,6 +7,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,12 +18,12 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
 	"tailscale.com/paths"
@@ -112,7 +113,7 @@ func Run(args []string) (err error) {
 	}
 
 	var warnOnce sync.Once
-	tailscale.SetVersionMismatchHandler(func(clientVer, serverVer string) {
+	local.SetVersionMismatchHandler(func(clientVer, serverVer string) {
 		warnOnce.Do(func() {
 			fmt.Fprintf(Stderr, "Warning: client version %q != tailscaled server version %q\n", clientVer, serverVer)
 		})
@@ -163,8 +164,8 @@ func Run(args []string) (err error) {
 	}
 
 	err = rootCmd.Run(context.Background())
-	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
-		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
+	if local.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
+		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s'.\nTo not require root, use 'sudo tailscale set --operator=$USER' once.", err, strings.Join(args, " "))
 	}
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
@@ -207,7 +208,17 @@ func noDupFlagify(c *ffcli.Command) {
 	}
 }
 
-var fileCmd func() *ffcli.Command
+var (
+	fileCmd,
+	sysPolicyCmd,
+	maybeWebCmd,
+	maybeDriveCmd,
+	maybeNetlockCmd,
+	maybeFunnelCmd,
+	maybeServeCmd,
+	maybeCertCmd,
+	_ func() *ffcli.Command
+)
 
 func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
@@ -217,8 +228,10 @@ func newRootCmd() *ffcli.Command {
 		return nil
 	})
 	rootfs.Lookup("socket").DefValue = localClient.Socket
+	jsonDocs := rootfs.Bool("json-docs", false, hidden+"print JSON-encoded docs for all subcommands and flags")
 
-	rootCmd := &ffcli.Command{
+	var rootCmd *ffcli.Command
+	rootCmd = &ffcli.Command{
 		Name:       "tailscale",
 		ShortUsage: "tailscale [flags] <subcommand> [command flags]",
 		ShortHelp:  "The easiest, most secure way to use WireGuard.",
@@ -236,7 +249,7 @@ change in the future.
 			logoutCmd,
 			switchCmd,
 			configureCmd(),
-			syspolicyCmd,
+			nilOrCall(sysPolicyCmd),
 			netcheckCmd,
 			ipCmd,
 			dnsCmd,
@@ -245,26 +258,29 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd(),
-			serveCmd(),
+			nilOrCall(maybeFunnelCmd),
+			nilOrCall(maybeServeCmd),
 			versionCmd,
-			webCmd,
+			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
 			bugReportCmd,
-			certCmd,
-			netlockCmd,
+			nilOrCall(maybeCertCmd),
+			nilOrCall(maybeNetlockCmd),
 			licensesCmd,
 			exitNodeCmd(),
 			updateCmd,
 			whoisCmd,
 			debugCmd(),
-			driveCmd,
+			nilOrCall(maybeDriveCmd),
 			idTokenCmd,
-			advertiseCmd(),
 			configureHostCmd(),
+			systrayCmd,
 		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
+			if *jsonDocs {
+				return printJSONDocs(rootCmd)
+			}
 			if len(args) > 0 {
 				return fmt.Errorf("tailscale: unknown subcommand: %s", args[0])
 			}
@@ -471,4 +487,71 @@ func colorableOutput() (w io.Writer, ok bool) {
 		return Stdout, false
 	}
 	return colorable.NewColorableStdout(), true
+}
+
+type commandDoc struct {
+	Name        string
+	Desc        string
+	Subcommands []commandDoc `json:",omitempty"`
+	Flags       []flagDoc    `json:",omitempty"`
+}
+
+type flagDoc struct {
+	Name string
+	Desc string
+}
+
+func printJSONDocs(root *ffcli.Command) error {
+	docs := jsonDocsWalk(root)
+	return json.NewEncoder(os.Stdout).Encode(docs)
+}
+
+func jsonDocsWalk(cmd *ffcli.Command) *commandDoc {
+	res := &commandDoc{
+		Name: cmd.Name,
+	}
+	if cmd.LongHelp != "" {
+		res.Desc = cmd.LongHelp
+	} else if cmd.ShortHelp != "" {
+		res.Desc = cmd.ShortHelp
+	} else {
+		res.Desc = cmd.ShortUsage
+	}
+	if strings.HasPrefix(res.Desc, hidden) {
+		return nil
+	}
+	if cmd.FlagSet != nil {
+		cmd.FlagSet.VisitAll(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Usage, hidden) {
+				return
+			}
+			res.Flags = append(res.Flags, flagDoc{
+				Name: f.Name,
+				Desc: f.Usage,
+			})
+		})
+	}
+	for _, sub := range cmd.Subcommands {
+		subj := jsonDocsWalk(sub)
+		if subj != nil {
+			res.Subcommands = append(res.Subcommands, *subj)
+		}
+	}
+	return res
+}
+
+func lastSeenFmt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := max(time.Since(t), time.Minute) // at least 1 minute
+
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf(", last seen %dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf(", last seen %dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf(", last seen %dd ago", int(d.Hours()/24))
+	}
 }

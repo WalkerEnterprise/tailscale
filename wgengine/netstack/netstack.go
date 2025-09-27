@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/metrics"
 	"tailscale.com/net/dns"
@@ -343,7 +344,7 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	}
 	supportedGSOKind := stack.GSONotSupported
 	supportedGROKind := groNotSupported
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && buildfeatures.HasGRO {
 		// TODO(jwhited): add Windows support https://github.com/tailscale/corp/issues/21874
 		supportedGROKind = tcpGROSupported
 		supportedGSOKind = stack.HostGSOSupported
@@ -577,9 +578,16 @@ func (ns *Impl) decrementInFlightTCPForward(tei stack.TransportEndpointID, remot
 	}
 }
 
+// LocalBackend is a fake name for *ipnlocal.LocalBackend to avoid an import cycle.
+type LocalBackend = any
+
 // Start sets up all the handlers so netstack can start working. Implements
 // wgengine.FakeImpl.
-func (ns *Impl) Start(lb *ipnlocal.LocalBackend) error {
+func (ns *Impl) Start(b LocalBackend) error {
+	if b == nil {
+		panic("nil LocalBackend interface")
+	}
+	lb := b.(*ipnlocal.LocalBackend)
 	if lb == nil {
 		panic("nil LocalBackend")
 	}
@@ -643,13 +651,15 @@ func (ns *Impl) UpdateNetstackIPs(nm *netmap.NetworkMap) {
 	var selfNode tailcfg.NodeView
 	var serviceAddrSet set.Set[netip.Addr]
 	if nm != nil {
-		vipServiceIPMap := nm.GetVIPServiceIPMap()
-		serviceAddrSet = make(set.Set[netip.Addr], len(vipServiceIPMap)*2)
-		for _, addrs := range vipServiceIPMap {
-			serviceAddrSet.AddSlice(addrs)
-		}
 		ns.atomicIsLocalIPFunc.Store(ipset.NewContainsIPFunc(nm.GetAddresses()))
-		ns.atomicIsVIPServiceIPFunc.Store(serviceAddrSet.Contains)
+		if buildfeatures.HasServe {
+			vipServiceIPMap := nm.GetVIPServiceIPMap()
+			serviceAddrSet = make(set.Set[netip.Addr], len(vipServiceIPMap)*2)
+			for _, addrs := range vipServiceIPMap {
+				serviceAddrSet.AddSlice(addrs)
+			}
+			ns.atomicIsVIPServiceIPFunc.Store(serviceAddrSet.Contains)
+		}
 		selfNode = nm.SelfNode
 	} else {
 		ns.atomicIsLocalIPFunc.Store(ipset.FalseContainsIPFunc())
@@ -1032,6 +1042,9 @@ func (ns *Impl) isLocalIP(ip netip.Addr) bool {
 // isVIPServiceIP reports whether ip is an IP address that's
 // assigned to a VIP service.
 func (ns *Impl) isVIPServiceIP(ip netip.Addr) bool {
+	if !buildfeatures.HasServe {
+		return false
+	}
 	return ns.atomicIsVIPServiceIPFunc.Load()(ip)
 }
 
@@ -1074,7 +1087,7 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 			return true
 		}
 	}
-	if isService {
+	if buildfeatures.HasServe && isService {
 		if p.IsEchoRequest() {
 			return true
 		}
@@ -1435,6 +1448,13 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	}
 }
 
+// tcpCloser is an interface to abstract around various TCPConn types that
+// allow closing of the read and write streams independently of each other.
+type tcpCloser interface {
+	CloseRead() error
+	CloseWrite() error
+}
+
 func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort) (handled bool) {
 	dialAddrStr := dialAddr.String()
 	if debugNetstack() {
@@ -1501,18 +1521,48 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 	}
 	defer client.Close()
 
+	// As of 2025-07-03, backend is always either a net.TCPConn
+	// from stdDialer.DialContext (which has the requisite functions),
+	// or nil from hangDialer in tests (in which case we would have
+	// errored out by now), so this conversion should always succeed.
+	backendTCPCloser, backendIsTCPCloser := backend.(tcpCloser)
 	connClosed := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(backend, client)
+		if err != nil {
+			err = fmt.Errorf("client -> backend: %w", err)
+		}
 		connClosed <- err
+		err = nil
+		if backendIsTCPCloser {
+			err = backendTCPCloser.CloseWrite()
+		}
+		err = errors.Join(err, client.CloseRead())
+		if err != nil {
+			ns.logf("client -> backend close connection: %v", err)
+		}
 	}()
 	go func() {
 		_, err := io.Copy(client, backend)
+		if err != nil {
+			err = fmt.Errorf("backend -> client: %w", err)
+		}
 		connClosed <- err
+		err = nil
+		if backendIsTCPCloser {
+			err = backendTCPCloser.CloseRead()
+		}
+		err = errors.Join(err, client.CloseWrite())
+		if err != nil {
+			ns.logf("backend -> client close connection: %v", err)
+		}
 	}()
-	err = <-connClosed
-	if err != nil {
-		ns.logf("proxy connection closed with error: %v", err)
+	// Wait for both ends of the connection to close.
+	for range 2 {
+		err = <-connClosed
+		if err != nil {
+			ns.logf("proxy connection closed with error: %v", err)
+		}
 	}
 	ns.logf("[v2] netstack: forwarder connection to %s closed", dialAddrStr)
 	return
@@ -1855,7 +1905,6 @@ func (ns *Impl) ExpVar() expvar.Var {
 		{"option_unknown_received", ipStats.OptionUnknownReceived},
 	}
 	for _, metric := range ipMetrics {
-		metric := metric
 		m.Set("counter_ip_"+metric.name, expvar.Func(func() any {
 			return readStatCounter(metric.field)
 		}))
@@ -1882,7 +1931,6 @@ func (ns *Impl) ExpVar() expvar.Var {
 		{"errors", fwdStats.Errors},
 	}
 	for _, metric := range fwdMetrics {
-		metric := metric
 		m.Set("counter_ip_forward_"+metric.name, expvar.Func(func() any {
 			return readStatCounter(metric.field)
 		}))
@@ -1926,7 +1974,6 @@ func (ns *Impl) ExpVar() expvar.Var {
 		{"forward_max_in_flight_drop", tcpStats.ForwardMaxInFlightDrop},
 	}
 	for _, metric := range tcpMetrics {
-		metric := metric
 		m.Set("counter_tcp_"+metric.name, expvar.Func(func() any {
 			return readStatCounter(metric.field)
 		}))
@@ -1953,7 +2000,6 @@ func (ns *Impl) ExpVar() expvar.Var {
 		{"checksum_errors", udpStats.ChecksumErrors},
 	}
 	for _, metric := range udpMetrics {
-		metric := metric
 		m.Set("counter_udp_"+metric.name, expvar.Func(func() any {
 			return readStatCounter(metric.field)
 		}))

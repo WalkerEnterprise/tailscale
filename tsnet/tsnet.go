@@ -27,11 +27,13 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
+	_ "tailscale.com/feature/condregister/oauthkey"
+	_ "tailscale.com/feature/condregister/portmapper"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
@@ -123,6 +125,12 @@ type Server struct {
 	// traffic. If zero, a port is automatically selected. Leave this
 	// field at zero unless you know what you are doing.
 	Port uint16
+
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
+	AdvertiseTags []string
 
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
@@ -274,7 +282,13 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(ipnauth.Self, s.lb, s.logf, s.logid)
+			lah := localapi.NewHandler(localapi.HandlerConfig{
+				Actor:    ipnauth.Self,
+				Backend:  s.lb,
+				Logf:     s.logf,
+				LogID:    s.logid,
+				EventBus: s.sys.Bus.Get(),
+			})
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -435,10 +449,7 @@ func (s *Server) Close() error {
 		ln.closeLocked()
 	}
 	wg.Wait()
-
-	if bus := s.sys.Bus.Get(); bus != nil {
-		bus.Close()
-	}
+	s.sys.Bus.Get().Close()
 	s.closed = true
 	return nil
 }
@@ -482,6 +493,16 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 	}
 
 	return ip4, ip6
+}
+
+// LogtailWriter returns an [io.Writer] that writes to Tailscale's logging service and will be only visible to Tailscale's
+// support team. Logs written there cannot be retrieved by the user. This method always returns a non-nil value.
+func (s *Server) LogtailWriter() io.Writer {
+	if s.logtail == nil {
+		return io.Discard
+	}
+
+	return s.logtail
 }
 
 func (s *Server) getAuthKey() string {
@@ -536,10 +557,7 @@ func (s *Server) start() (reterr error) {
 		if err != nil {
 			return err
 		}
-		s.rootPath, err = getTSNetDir(s.logf, confDir, prog)
-		if err != nil {
-			return err
-		}
+		s.rootPath = filepath.Join(confDir, "tsnet-"+prog)
 	}
 	if err := os.MkdirAll(s.rootPath, 0700); err != nil {
 		return err
@@ -562,7 +580,7 @@ func (s *Server) start() (reterr error) {
 
 	sys := tsd.NewSystem()
 	s.sys = sys
-	if err := s.startLogger(&closePool, sys.HealthTracker(), tsLogf); err != nil {
+	if err := s.startLogger(&closePool, sys.HealthTracker.Get(), tsLogf); err != nil {
 		return err
 	}
 
@@ -580,7 +598,7 @@ func (s *Server) start() (reterr error) {
 		Dialer:        s.dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
@@ -588,7 +606,7 @@ func (s *Server) start() (reterr error) {
 	}
 	closePool.add(s.dialer)
 	sys.Set(eng)
-	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
+	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
@@ -662,7 +680,16 @@ func (s *Server) start() (reterr error) {
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
 	prefs.RunWebClient = s.RunWebClient
+	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
+	// Try to use an OAuth secret to generate an auth key if that functionality
+	// is available.
+	if f, ok := tailscale.HookResolveAuthKey.GetOk(); ok {
+		authKey, err = f(s.shutdownCtx, s.getAuthKey(), prefs.AdvertiseTags)
+		if err != nil {
+			return fmt.Errorf("resolving auth key: %w", err)
+		}
+	}
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
 		AuthKey:     authKey,
@@ -682,7 +709,13 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(ipnauth.Self, lb, tsLogf, s.logid)
+	lah := localapi.NewHandler(localapi.HandlerConfig{
+		Actor:    ipnauth.Self,
+		Backend:  lb,
+		Logf:     tsLogf,
+		LogID:    s.logid,
+		EventBus: sys.Bus.Get(),
+	})
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -895,68 +928,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		return nil, true // don't handle, don't forward to localhost
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
-}
-
-// getTSNetDir usually just returns filepath.Join(confDir, "tsnet-"+prog)
-// with no error.
-//
-// One special case is that it renames old "tslib-" directories to
-// "tsnet-", and that rename might return an error.
-//
-// TODO(bradfitz): remove this maybe 6 months after 2022-03-17,
-// once people (notably Tailscale corp services) have updated.
-func getTSNetDir(logf logger.Logf, confDir, prog string) (string, error) {
-	oldPath := filepath.Join(confDir, "tslib-"+prog)
-	newPath := filepath.Join(confDir, "tsnet-"+prog)
-
-	fi, err := os.Lstat(oldPath)
-	if os.IsNotExist(err) {
-		// Common path.
-		return newPath, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if !fi.IsDir() {
-		return "", fmt.Errorf("expected old tslib path %q to be a directory; got %v", oldPath, fi.Mode())
-	}
-
-	// At this point, oldPath exists and is a directory. But does
-	// the new path exist?
-
-	fi, err = os.Lstat(newPath)
-	if err == nil && fi.IsDir() {
-		// New path already exists somehow. Ignore the old one and
-		// don't try to migrate it.
-		return newPath, nil
-	}
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return "", err
-	}
-	logf("renamed old tsnet state storage directory %q to %q", oldPath, newPath)
-	return newPath, nil
-}
-
-// APIClient returns a tailscale.Client that can be used to make authenticated
-// requests to the Tailscale control server.
-// It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
-//
-// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
-func (s *Server) APIClient() (*tailscale.Client, error) {
-	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
-		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-
-	c := tailscale.NewClient("-", nil)
-	c.UserAgent = "tailscale-tsnet"
-	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
-	return c, nil
 }
 
 // I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
@@ -1315,6 +1286,12 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	s.mu.Unlock()
 	return ln, nil
+}
+
+// GetRootPath returns the root path of the tsnet server.
+// This is where the state file and other data is stored.
+func (s *Server) GetRootPath() string {
+	return s.rootPath
 }
 
 // CapturePcap can be called by the application code compiled with tsnet to save a pcap

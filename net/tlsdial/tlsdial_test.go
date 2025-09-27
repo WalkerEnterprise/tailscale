@@ -16,6 +16,7 @@ import (
 
 	"tailscale.com/health"
 	"tailscale.com/net/bakedroots"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 func TestFallbackRootWorks(t *testing.T) {
@@ -85,8 +86,8 @@ func TestFallbackRootWorks(t *testing.T) {
 		},
 		DisableKeepAlives: true, // for test cleanup ease
 	}
-	ht := new(health.Tracker)
-	tr.TLSClientConfig = Config("tlsdial.test", ht, tr.TLSClientConfig)
+	ht := health.NewTracker(eventbustest.NewBus(t))
+	tr.TLSClientConfig = Config(ht, tr.TLSClientConfig)
 	c := &http.Client{Transport: tr}
 
 	ctr0 := atomic.LoadInt32(&counterFallbackOK)

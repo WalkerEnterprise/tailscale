@@ -10,14 +10,15 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/cmd/tailscaled/tailscaledhooks"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnstate"
@@ -31,6 +32,13 @@ import (
 
 func init() {
 	ipnext.RegisterExtension("taildrop", newExtension)
+
+	if runtime.GOOS == "windows" {
+		tailscaledhooks.UninstallSystemDaemonWindows.Add(func() {
+			// Remove file sharing from Windows shell.
+			osshare.SetFileSharingEnabled(false, logger.Discard)
+		})
+	}
 }
 
 func newExtension(logf logger.Logf, b ipnext.SafeBackend) (ipnext.Extension, error) {
@@ -64,6 +72,10 @@ type Extension struct {
 	// *.partial file to its final name on completion.
 	directFileRoot string
 
+	// FileOps abstracts platform-specific file operations needed for file transfers.
+	// This is currently being used for Android to use the Storage Access Framework.
+	fileOps FileOps
+
 	nodeBackendForTest ipnext.NodeBackend // if non-nil, pretend we're this node state for tests
 
 	mu             sync.Mutex // Lock order: lb.mu > e.mu
@@ -91,6 +103,11 @@ func (e *Extension) Init(h ipnext.Host) error {
 	h.Hooks().SetPeerStatus.Add(e.setPeerStatus)
 	h.Hooks().BackendStateChange.Add(e.onBackendStateChange)
 
+	// TODO(nickkhyl): remove this after the profileManager refactoring.
+	// See tailscale/tailscale#15974.
+	// This same workaround appears in feature/portlist/portlist.go.
+	profile, prefs := h.Profiles().CurrentProfileState()
+	e.onChangeProfile(profile, prefs, false)
 	return nil
 }
 
@@ -135,17 +152,34 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 		return
 	}
 
-	// If we have a netmap, create a taildrop manager.
-	fileRoot, isDirectFileMode := e.fileRoot(uid, activeLogin)
-	if fileRoot == "" {
-		e.logf("no Taildrop directory configured")
+	// Use the provided [FileOps] implementation (typically for SAF access on Android),
+	// or create an [fsFileOps] instance rooted at fileRoot.
+	//
+	// A non-nil [FileOps] also implies that we are in DirectFileMode.
+	fops := e.fileOps
+	isDirectFileMode := fops != nil
+	if fops == nil {
+		var fileRoot string
+		if fileRoot, isDirectFileMode = e.fileRoot(uid, activeLogin); fileRoot == "" {
+			e.logf("no Taildrop directory configured")
+			e.setMgrLocked(nil)
+			return
+		}
+
+		var err error
+		if fops, err = newFileOps(fileRoot); err != nil {
+			e.logf("taildrop: cannot create FileOps: %v", err)
+			e.setMgrLocked(nil)
+			return
+		}
 	}
+
 	e.setMgrLocked(managerOptions{
 		Logf:           e.logf,
 		Clock:          tstime.DefaultClock{Clock: e.sb.Clock()},
 		State:          e.stateStore,
-		Dir:            fileRoot,
 		DirectFileMode: isDirectFileMode,
+		fileOps:        fops,
 		SendFileNotify: e.sendFileNotify,
 	}.New())
 }
@@ -174,12 +208,7 @@ func (e *Extension) fileRoot(uid tailcfg.UserID, activeLogin string) (root strin
 	baseDir := fmt.Sprintf("%s-uid-%d",
 		strings.ReplaceAll(activeLogin, "@", "-"),
 		uid)
-	dir := filepath.Join(varRoot, "files", baseDir)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		e.logf("Taildrop disabled; error making directory: %v", err)
-		return "", false
-	}
-	return dir, false
+	return filepath.Join(varRoot, "files", baseDir), false
 }
 
 // hasCapFileSharing reports whether the current node has the file sharing

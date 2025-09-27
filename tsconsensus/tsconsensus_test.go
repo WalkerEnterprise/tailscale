@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
+	"tailscale.com/util/cibuild"
 	"tailscale.com/util/racebuild"
 )
 
@@ -113,6 +115,9 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 }
 
 func testConfig(t *testing.T) {
+	if runtime.GOOS == "windows" && cibuild.On() {
+		t.Skip("cmd/natc isn't supported on Windows, so skipping tsconsensus tests on CI for now; see https://github.com/tailscale/tailscale/issues/16340")
+	}
 	// -race AND Parallel makes things start to take too long.
 	if !racebuild.On {
 		t.Parallel()
@@ -257,7 +262,7 @@ func TestStart(t *testing.T) {
 	waitForNodesToBeTaggedInStatus(t, ctx, one, []key.NodePublic{k}, clusterTag)
 
 	sm := &fsm{}
-	r, err := Start(ctx, one, sm, clusterTag, warnLogConfig())
+	r, err := Start(ctx, one, sm, BootstrapOpts{Tag: clusterTag}, warnLogConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +334,7 @@ func createConsensusCluster(t testing.TB, ctx context.Context, clusterTag string
 	t.Helper()
 	participants[0].sm = &fsm{}
 	myCfg := addIDedLogger("0", cfg)
-	first, err := Start(ctx, participants[0].ts, participants[0].sm, clusterTag, myCfg)
+	first, err := Start(ctx, participants[0].ts, participants[0].sm, BootstrapOpts{Tag: clusterTag}, myCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +347,7 @@ func createConsensusCluster(t testing.TB, ctx context.Context, clusterTag string
 	for i := 1; i < len(participants); i++ {
 		participants[i].sm = &fsm{}
 		myCfg := addIDedLogger(fmt.Sprintf("%d", i), cfg)
-		c, err := Start(ctx, participants[i].ts, participants[i].sm, clusterTag, myCfg)
+		c, err := Start(ctx, participants[i].ts, participants[i].sm, BootstrapOpts{Tag: clusterTag}, myCfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -525,7 +530,7 @@ func TestFollowerFailover(t *testing.T) {
 	// follower comes back
 	smThreeAgain := &fsm{}
 	cfg = addIDedLogger("2 after restarting", warnLogConfig())
-	rThreeAgain, err := Start(ctx, ps[2].ts, smThreeAgain, clusterTag, cfg)
+	rThreeAgain, err := Start(ctx, ps[2].ts, smThreeAgain, BootstrapOpts{Tag: clusterTag}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +565,7 @@ func TestRejoin(t *testing.T) {
 	tagNodes(t, control, []key.NodePublic{keyJoiner}, clusterTag)
 	waitForNodesToBeTaggedInStatus(t, ctx, ps[0].ts, []key.NodePublic{keyJoiner}, clusterTag)
 	smJoiner := &fsm{}
-	cJoiner, err := Start(ctx, tsJoiner, smJoiner, clusterTag, cfg)
+	cJoiner, err := Start(ctx, tsJoiner, smJoiner, BootstrapOpts{Tag: clusterTag}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -737,5 +742,25 @@ func TestOnlyTaggedPeersCanJoin(t *testing.T) {
 	expected := "peer not allowed"
 	if sBody != expected {
 		t.Fatalf("join req when not tagged, expected body: %s, got: %s", expected, sBody)
+	}
+}
+
+func TestFollowOnly(t *testing.T) {
+	testConfig(t)
+	ctx := context.Background()
+	clusterTag := "tag:whatever"
+	ps, _, _ := startNodesAndWaitForPeerStatus(t, ctx, clusterTag, 3)
+	cfg := warnLogConfig()
+
+	// start the leader
+	_, err := Start(ctx, ps[0].ts, ps[0].sm, BootstrapOpts{Tag: clusterTag}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// start the follower with FollowOnly
+	_, err = Start(ctx, ps[1].ts, ps[1].sm, BootstrapOpts{Tag: clusterTag, FollowOnly: true}, cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

@@ -30,7 +30,9 @@ import (
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 )
 
@@ -846,7 +848,7 @@ func TestBackgroundProfileResolver(t *testing.T) {
 
 			// Create a new profile manager and add the profiles to it.
 			// We expose the profile manager to the extensions via the read-only [ipnext.ProfileStore] interface.
-			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, health.NewTracker(eventbustest.NewBus(t))))
 			for i, p := range tt.profiles {
 				// Generate a unique ID and key for each profile,
 				// unless the profile already has them set
@@ -1042,6 +1044,38 @@ func TestNilExtensionHostMethodCall(t *testing.T) {
 	}
 }
 
+// extBeforeStartExtension is a test extension used by TestGetExtBeforeStart.
+// It is registered with the [ipnext.RegisterExtension].
+type extBeforeStartExtension struct{}
+
+func init() {
+	ipnext.RegisterExtension("ext-before-start", mkExtBeforeStartExtension)
+}
+
+func mkExtBeforeStartExtension(logger.Logf, ipnext.SafeBackend) (ipnext.Extension, error) {
+	return extBeforeStartExtension{}, nil
+}
+
+func (extBeforeStartExtension) Name() string { return "ext-before-start" }
+func (extBeforeStartExtension) Init(ipnext.Host) error {
+	return nil
+}
+func (extBeforeStartExtension) Shutdown() error {
+	return nil
+}
+
+// TestGetExtBeforeStart verifies that an extension registered via
+// RegisterExtension can be retrieved with GetExt before the host is started
+// (via LocalBackend.Start)
+func TestGetExtBeforeStart(t *testing.T) {
+	lb := newTestBackend(t)
+	// Now call GetExt without calling Start on the LocalBackend.
+	_, ok := GetExt[extBeforeStartExtension](lb)
+	if !ok {
+		t.Fatal("didn't find extension")
+	}
+}
+
 // checkMethodCallWithZeroArgs calls the method m on the receiver r
 // with zero values for all its arguments, except the receiver itself.
 // It returns the result of the method call, or fails the test if the call panics.
@@ -1151,6 +1185,10 @@ type testExtension struct {
 
 var _ ipnext.Extension = (*testExtension)(nil)
 
+// PermitDoubleRegister is a sentinel method whose existence tells the
+// ExtensionHost to permit it to be registered multiple times.
+func (*testExtension) PermitDoubleRegister() {}
+
 func (e *testExtension) setT(t *testing.T) {
 	e.t = t
 }
@@ -1193,7 +1231,7 @@ func (e *testExtension) InitCalled() bool {
 func (e *testExtension) Shutdown() (err error) {
 	e.t.Helper()
 	e.mu.Lock()
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 	if e.ShutdownHook != nil {
 		err = e.ShutdownHook(e)
 	}

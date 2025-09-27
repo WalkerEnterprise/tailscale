@@ -110,6 +110,17 @@ main() {
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
+			industrial-os)
+				OS="debian"
+				PACKAGETYPE="apt"
+				if [ "$(printf %.1s "$VERSION_ID")" -lt 5 ]; then
+					VERSION="buster"
+					APT_KEY_TYPE="legacy"
+				else
+					VERSION="bullseye"
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
 			parrot|mendel)
 				OS="debian"
 				PACKAGETYPE="apt"
@@ -280,6 +291,14 @@ main() {
 				echo "services.tailscale.enable = true;"
 				exit 1
 				;;
+			bazzite)
+				echo "Bazzite comes with Tailscale installed by default."
+				echo "Please enable Tailscale by running the following commands as root:"
+				echo
+				echo "ujust enable-tailscale"
+				echo "tailscale up"
+				exit 1
+				;;
 			void)
 				OS="$ID"
 				VERSION="" # rolling release
@@ -400,7 +419,8 @@ main() {
 		freebsd)
 			if [ "$VERSION" != "12" ] && \
 			   [ "$VERSION" != "13" ] && \
-			   [ "$VERSION" != "14" ]
+			   [ "$VERSION" != "14" ] && \
+			   [ "$VERSION" != "15" ]
 			then
 				OS_UNSUPPORTED=1
 			fi

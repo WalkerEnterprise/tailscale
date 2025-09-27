@@ -40,8 +40,8 @@ type Bus struct {
 	clients   set.Set[*Client]
 }
 
-// New returns a new bus. Use [PublisherOf] to make event publishers,
-// and [Bus.Queue] and [Subscribe] to make event subscribers.
+// New returns a new bus. Use [Publish] to make event publishers,
+// and [Subscribe] and [SubscribeFunc] to make event subscribers.
 func New() *Bus {
 	ret := &Bus{
 		write:    make(chan PublishedEvent),
@@ -77,7 +77,7 @@ func (b *Bus) Debugger() *Debugger {
 	return &Debugger{b}
 }
 
-// Close closes the bus. Implicitly closes all clients, publishers and
+// Close closes the bus. It implicitly closes all clients, publishers and
 // subscribers attached to the bus.
 //
 // Close blocks until the bus is fully shut down. The bus is

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -15,9 +16,11 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"go4.org/mem"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
@@ -25,7 +28,9 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
@@ -1138,33 +1143,305 @@ func BenchmarkMapSessionDelta(b *testing.B) {
 	}
 }
 
+// TestNetmapDisplayMessage checks that the various diff operations
+// (add/update/delete/clear) for [tailcfg.DisplayMessage] in a
+// [tailcfg.MapResponse] work as expected.
+func TestNetmapDisplayMessage(t *testing.T) {
+	type test struct {
+		name         string
+		initialState *tailcfg.MapResponse
+		mapResponse  tailcfg.MapResponse
+		wantMessages map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
+	}
+
+	tests := []test{
+		{
+			name: "basic-set",
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"test-message": {
+						Title:               "Testing",
+						Text:                "This is a test message",
+						Severity:            tailcfg.SeverityHigh,
+						ImpactsConnectivity: true,
+						PrimaryAction: &tailcfg.DisplayMessageAction{
+							URL:   "https://www.example.com",
+							Label: "Learn more",
+						},
+					},
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test-message": {
+					Title:               "Testing",
+					Text:                "This is a test message",
+					Severity:            tailcfg.SeverityHigh,
+					ImpactsConnectivity: true,
+					PrimaryAction: &tailcfg.DisplayMessageAction{
+						URL:   "https://www.example.com",
+						Label: "Learn more",
+					},
+				},
+			},
+		},
+		{
+			name: "delete-one",
+			initialState: &tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A",
+					},
+					"message-b": {
+						Title: "Message B",
+					},
+				},
+			},
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": nil,
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"message-b": {
+					Title: "Message B",
+				},
+			},
+		},
+		{
+			name: "update-one",
+			initialState: &tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A",
+					},
+					"message-b": {
+						Title: "Message B",
+					},
+				},
+			},
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A updated",
+					},
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"message-a": {
+					Title: "Message A updated",
+				},
+				"message-b": {
+					Title: "Message B",
+				},
+			},
+		},
+		{
+			name: "add-one",
+			initialState: &tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A",
+					},
+				},
+			},
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-b": {
+						Title: "Message B",
+					},
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"message-a": {
+					Title: "Message A",
+				},
+				"message-b": {
+					Title: "Message B",
+				},
+			},
+		},
+		{
+			name: "delete-all",
+			initialState: &tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A",
+					},
+					"message-b": {
+						Title: "Message B",
+					},
+				},
+			},
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"*": nil,
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{},
+		},
+		{
+			name: "delete-all-and-add",
+			initialState: &tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"message-a": {
+						Title: "Message A",
+					},
+					"message-b": {
+						Title: "Message B",
+					},
+				},
+			},
+			mapResponse: tailcfg.MapResponse{
+				DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+					"*": nil,
+					"message-c": {
+						Title: "Message C",
+					},
+				},
+			},
+			wantMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"message-c": {
+					Title: "Message C",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ms := newTestMapSession(t, nil)
+
+			if test.initialState != nil {
+				ms.netmapForResponse(test.initialState)
+			}
+
+			nm := ms.netmapForResponse(&test.mapResponse)
+
+			if diff := cmp.Diff(test.wantMessages, nm.DisplayMessages, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("unexpected warnings (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 // TestNetmapHealthIntegration checks that we get the expected health warnings
-// from processing a map response and passing the NetworkMap to a health tracker
+// from processing a [tailcfg.MapResponse] containing health messages and passing the
+// [netmap.NetworkMap] to a [health.Tracker].
 func TestNetmapHealthIntegration(t *testing.T) {
 	ms := newTestMapSession(t, nil)
-	ht := health.Tracker{}
+	ht := health.NewTracker(eventbustest.NewBus(t))
 
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
 
 	nm := ms.netmapForResponse(&tailcfg.MapResponse{
-		Health: []string{"Test message"},
+		Health: []string{
+			"Test message",
+			"Another message",
+		},
 	})
-	ht.SetControlHealth(nm.ControlHealth)
+	ht.SetControlHealth(nm.DisplayMessages)
+
+	want := map[health.WarnableCode]health.UnhealthyState{
+		"control-health.health-c0719e9a8d5d838d861dc6f675c899d2b309a3a65bb9fe6b11e5afcbf9a2c0b1": {
+			WarnableCode: "control-health.health-c0719e9a8d5d838d861dc6f675c899d2b309a3a65bb9fe6b11e5afcbf9a2c0b1",
+			Title:        "Coordination server reports an issue",
+			Severity:     health.SeverityMedium,
+			Text:         "The coordination server is reporting a health issue: Test message",
+		},
+		"control-health.health-1dc7017a73a3c55c0d6a8423e3813c7ab6562d9d3064c2ec6ac7822f61b1db9c": {
+			WarnableCode: "control-health.health-1dc7017a73a3c55c0d6a8423e3813c7ab6562d9d3064c2ec6ac7822f61b1db9c",
+			Title:        "Coordination server reports an issue",
+			Severity:     health.SeverityMedium,
+			Text:         "The coordination server is reporting a health issue: Another message",
+		},
+	}
+
+	got := maps.Clone(ht.CurrentState().Warnings)
+	for k := range got {
+		if !strings.HasPrefix(string(k), "control-health") {
+			delete(got, k)
+		}
+	}
+
+	if d := cmp.Diff(want, got, cmpopts.IgnoreFields(health.UnhealthyState{}, "ETag")); d != "" {
+		t.Fatalf("CurrentStatus().Warnings[\"control-health*\"] different than expected (-want +got)\n%s", d)
+	}
+}
+
+// TestNetmapDisplayMessageIntegration checks that we get the expected health
+// warnings from processing a [tailcfg.MapResponse] that contains DisplayMessages and
+// passing the [netmap.NetworkMap] to a [health.Tracker].
+func TestNetmapDisplayMessageIntegration(t *testing.T) {
+	ms := newTestMapSession(t, nil)
+	ht := health.NewTracker(eventbustest.NewBus(t))
+
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+	baseWarnings := ht.CurrentState().Warnings
+
+	nm := ms.netmapForResponse(&tailcfg.MapResponse{
+		DisplayMessages: map[tailcfg.DisplayMessageID]*tailcfg.DisplayMessage{
+			"test-message": {
+				Title:               "Testing",
+				Text:                "This is a test message",
+				Severity:            tailcfg.SeverityHigh,
+				ImpactsConnectivity: true,
+				PrimaryAction: &tailcfg.DisplayMessageAction{
+					URL:   "https://www.example.com",
+					Label: "Learn more",
+				},
+			},
+		},
+	})
+	ht.SetControlHealth(nm.DisplayMessages)
 
 	state := ht.CurrentState()
-	warning, ok := state.Warnings["control-health"]
 
-	if !ok {
-		t.Fatal("no warning found in current state with code 'control-health'")
+	// Ignore warnings that aren't from the netmap
+	for k := range baseWarnings {
+		delete(state.Warnings, k)
 	}
-	if got, want := warning.Title, "Coordination server reports an issue"; got != want {
-		t.Errorf("warning.Title = %q, want %q", got, want)
+
+	want := map[health.WarnableCode]health.UnhealthyState{
+		"control-health.test-message": {
+			WarnableCode:        "control-health.test-message",
+			Title:               "Testing",
+			Text:                "This is a test message",
+			Severity:            health.SeverityHigh,
+			ImpactsConnectivity: true,
+			PrimaryAction: &health.UnhealthyStateAction{
+				URL:   "https://www.example.com",
+				Label: "Learn more",
+			},
+		},
 	}
-	if got, want := warning.Severity, health.SeverityMedium; got != want {
-		t.Errorf("warning.Severity = %s, want %s", got, want)
+
+	if diff := cmp.Diff(want, state.Warnings, cmpopts.IgnoreFields(health.UnhealthyState{}, "ETag")); diff != "" {
+		t.Errorf("unexpected message contents (-want +got):\n%s", diff)
 	}
-	if got, want := warning.Text, "The coordination server is reporting an health issue: Test message"; got != want {
-		t.Errorf("warning.Text = %q, want %q", got, want)
+}
+
+func TestNetmapForMapResponseForDebug(t *testing.T) {
+	mr := &tailcfg.MapResponse{
+		Node: &tailcfg.Node{
+			ID:   1,
+			Name: "foo.bar.ts.net.",
+		},
+		Peers: []*tailcfg.Node{
+			{ID: 2, Name: "peer1.bar.ts.net.", HomeDERP: 1},
+			{ID: 3, Name: "peer2.bar.ts.net.", HomeDERP: 1},
+		},
+	}
+	ms := newTestMapSession(t, nil)
+	nm1 := ms.netmapForResponse(mr)
+
+	prefs := &ipn.Prefs{Persist: &persist.Persist{PrivateNodeKey: ms.privateNodeKey}}
+	nm2, err := NetmapFromMapResponseForDebug(t.Context(), prefs.View().Persist(), mr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(nm1, nm2) {
+		t.Errorf("mismatch\nnm1: %s\nnm2: %s\n", logger.AsJSON(nm1), logger.AsJSON(nm2))
 	}
 }

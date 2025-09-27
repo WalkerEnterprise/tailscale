@@ -21,16 +21,16 @@ type Publisher[T any] struct {
 }
 
 func newPublisher[T any](c *Client) *Publisher[T] {
-	ret := &Publisher[T]{
-		client: c,
-	}
-	c.addPublisher(ret)
-	return ret
+	return &Publisher[T]{client: c}
 }
 
 // Close closes the publisher.
 //
 // Calls to Publish after Close silently do nothing.
+//
+// If the Bus or Client from which the Publisher was created is closed,
+// the Publisher is implicitly closed and does not need to be closed
+// separately.
 func (p *Publisher[T]) Close() {
 	// Just unblocks any active calls to Publish, no other
 	// synchronization needed.

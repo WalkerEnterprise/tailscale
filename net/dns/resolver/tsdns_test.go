@@ -31,7 +31,7 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 var (
@@ -356,7 +356,7 @@ func newResolver(t testing.TB) *Resolver {
 	return New(t.Logf,
 		nil, // no link selector
 		tsdial.NewDialer(netmon.NewStatic()),
-		new(health.Tracker),
+		health.NewTracker(eventbustest.NewBus(t)),
 		nil, // no control knobs
 	)
 }
@@ -1060,8 +1060,7 @@ func TestForwardLinkSelection(t *testing.T) {
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	bus := eventbus.New()
-	defer bus.Close()
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, ".... netmon: "))
 	if err != nil {
@@ -1074,7 +1073,7 @@ func TestForwardLinkSelection(t *testing.T) {
 			return "special"
 		}
 		return ""
-	}), new(tsdial.Dialer), new(health.Tracker), nil /* no control knobs */)
+	}), new(tsdial.Dialer), health.NewTracker(bus), nil /* no control knobs */)
 
 	// Test non-special IP.
 	if got, err := fwd.packetListener(netip.Addr{}); err != nil {
@@ -1106,10 +1105,6 @@ type linkSelFunc func(ip netip.Addr) string
 func (f linkSelFunc) PickLink(ip netip.Addr) string { return f(ip) }
 
 func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping test on Windows; waiting for golang.org/issue/33097")
-	}
-
 	records := []any{
 		"no-records.test.",
 		dnsHandler(),
@@ -1405,9 +1400,6 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 // newWrapResolver returns a resolver that uses r (via handleExitNodeDNSQueryWithNetPkg)
 // to make DNS requests.
 func newWrapResolver(r *net.Resolver) *net.Resolver {
-	if runtime.GOOS == "windows" {
-		panic("doesn't work on Windows") // golang.org/issue/33097
-	}
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {

@@ -53,7 +53,7 @@ type osMon interface {
 type Monitor struct {
 	logf    logger.Logf
 	b       *eventbus.Client
-	changed *eventbus.Publisher[*ChangeDelta]
+	changed *eventbus.Publisher[ChangeDelta]
 
 	om     osMon         // nil means not supported on this platform
 	change chan bool     // send false to wake poller, true to also force ChangeDeltas be sent
@@ -66,7 +66,6 @@ type Monitor struct {
 
 	mu         sync.Mutex // guards all following fields
 	cbs        set.HandleSet[ChangeFunc]
-	ruleDelCB  set.HandleSet[RuleDeleteCallback]
 	ifState    *State
 	gwValid    bool       // whether gw and gwSelfIP are valid
 	gw         netip.Addr // our gateway's IP
@@ -85,9 +84,6 @@ type ChangeFunc func(*ChangeDelta)
 
 // ChangeDelta describes the difference between two network states.
 type ChangeDelta struct {
-	// Monitor is the network monitor that sent this delta.
-	Monitor *Monitor
-
 	// Old is the old interface state, if known.
 	// It's nil if the old state is unknown.
 	// Do not mutate it.
@@ -127,7 +123,7 @@ func New(bus *eventbus.Bus, logf logger.Logf) (*Monitor, error) {
 		stop:     make(chan struct{}),
 		lastWall: wallTime(),
 	}
-	m.changed = eventbus.Publish[*ChangeDelta](m.b)
+	m.changed = eventbus.Publish[ChangeDelta](m.b)
 	st, err := m.interfaceStateUncached()
 	if err != nil {
 		return nil, err
@@ -221,29 +217,6 @@ func (m *Monitor) RegisterChangeCallback(callback ChangeFunc) (unregister func()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		delete(m.cbs, handle)
-	}
-}
-
-// RuleDeleteCallback is a callback when a Linux IP policy routing
-// rule is deleted. The table is the table number (52, 253, 354) and
-// priority is the priority order number (for Tailscale rules
-// currently: 5210, 5230, 5250, 5270)
-type RuleDeleteCallback func(table uint8, priority uint32)
-
-// RegisterRuleDeleteCallback adds callback to the set of parties to be
-// notified (in their own goroutine) when a Linux ip rule is deleted.
-// To remove this callback, call unregister (or close the monitor).
-func (m *Monitor) RegisterRuleDeleteCallback(callback RuleDeleteCallback) (unregister func()) {
-	if m.static {
-		return func() {}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	handle := m.ruleDelCB.Add(callback)
-	return func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		delete(m.ruleDelCB, handle)
 	}
 }
 
@@ -359,22 +332,10 @@ func (m *Monitor) pump() {
 			time.Sleep(time.Second)
 			continue
 		}
-		if rdm, ok := msg.(ipRuleDeletedMessage); ok {
-			m.notifyRuleDeleted(rdm)
-			continue
-		}
 		if msg.ignore() {
 			continue
 		}
 		m.Poll()
-	}
-}
-
-func (m *Monitor) notifyRuleDeleted(rdm ipRuleDeletedMessage) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, cb := range m.ruleDelCB {
-		go cb(rdm.table, rdm.priority)
 	}
 }
 
@@ -437,8 +398,7 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 		return
 	}
 
-	delta := &ChangeDelta{
-		Monitor:    m,
+	delta := ChangeDelta{
 		Old:        oldState,
 		New:        newState,
 		TimeJumped: timeJumped,
@@ -473,7 +433,7 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 	}
 	m.changed.Publish(delta)
 	for _, cb := range m.cbs {
-		go cb(delta)
+		go cb(&delta)
 	}
 }
 
@@ -624,10 +584,3 @@ func (m *Monitor) checkWallTimeAdvanceLocked() bool {
 func (m *Monitor) resetTimeJumpedLocked() {
 	m.timeJumped = false
 }
-
-type ipRuleDeletedMessage struct {
-	table    uint8
-	priority uint32
-}
-
-func (ipRuleDeletedMessage) ignore() bool { return true }

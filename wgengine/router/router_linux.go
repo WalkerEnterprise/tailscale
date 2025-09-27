@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/preftype"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/linuxfw"
 	"tailscale.com/util/multierr"
 	"tailscale.com/version/distro"
@@ -48,6 +49,8 @@ type linuxRouter struct {
 	tunname           string
 	netMon            *netmon.Monitor
 	health            *health.Tracker
+	eventSubs         eventbus.Monitor
+	rulesAddedPub     *eventbus.Publisher[AddIPRules]
 	unregNetMon       func()
 	addrs             map[netip.Prefix]bool
 	routes            map[netip.Prefix]bool
@@ -77,7 +80,7 @@ type linuxRouter struct {
 	magicsockPortV6 uint16
 }
 
-func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (Router, error) {
 	tunname, err := tunDev.Name()
 	if err != nil {
 		return nil, err
@@ -87,10 +90,10 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Moni
 		ambientCapNetAdmin: useAmbientCaps(),
 	}
 
-	return newUserspaceRouterAdvanced(logf, tunname, netMon, cmd, health)
+	return newUserspaceRouterAdvanced(logf, tunname, netMon, cmd, health, bus)
 }
 
-func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, cmd commandRunner, health *health.Tracker) (Router, error) {
+func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, cmd commandRunner, health *health.Tracker, bus *eventbus.Bus) (Router, error) {
 	r := &linuxRouter{
 		logf:          logf,
 		tunname:       tunname,
@@ -103,6 +106,10 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 		ipRuleFixLimiter: rate.NewLimiter(rate.Every(5*time.Second), 10),
 		ipPolicyPrefBase: 5200,
 	}
+	ec := bus.Client("router-linux")
+	r.rulesAddedPub = eventbus.Publish[AddIPRules](ec)
+	r.eventSubs = ec.Monitor(r.consumeEventbusTopics(ec))
+
 	if r.useIPCommand() {
 		r.ipRuleAvailable = (cmd.run("ip", "rule") == nil)
 	} else {
@@ -143,6 +150,25 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 	r.fixupWSLMTU()
 
 	return r, nil
+}
+
+// consumeEventbusTopics consumes events from all [Conn]-relevant
+// [eventbus.Subscriber]'s and passes them to their related handler. Events are
+// always handled in the order they are received, i.e. the next event is not
+// read until the previous event's handler has returned. It returns when the
+// [eventbus.Client] is closed.
+func (r *linuxRouter) consumeEventbusTopics(ec *eventbus.Client) func(*eventbus.Client) {
+	ruleDeletedSub := eventbus.Subscribe[netmon.RuleDeleted](ec)
+	return func(ec *eventbus.Client) {
+		for {
+			select {
+			case <-ec.Done():
+				return
+			case rs := <-ruleDeletedSub.Events():
+				r.onIPRuleDeleted(rs.Table, rs.Priority)
+			}
+		}
+	}
 }
 
 // ipCmdSupportsFwmask returns true if the system 'ip' binary supports using a
@@ -276,6 +302,10 @@ func (r *linuxRouter) fwmaskWorks() bool {
 	return v
 }
 
+// AddIPRules is used as an event signal to signify that rules have been added.
+// It is added to aid testing, but could be extended if there's a reason for it.
+type AddIPRules struct{}
+
 // onIPRuleDeleted is the callback from the network monitor for when an IP
 // policy rule is deleted. See Issue 1591.
 //
@@ -303,6 +333,9 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 		r.ruleRestorePending.Swap(false)
 		return
 	}
+
+	r.rulesAddedPub.Publish(AddIPRules{})
+
 	time.AfterFunc(rr.Delay()+250*time.Millisecond, func() {
 		if r.ruleRestorePending.Swap(false) && !r.closed.Load() {
 			r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
@@ -312,9 +345,6 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 }
 
 func (r *linuxRouter) Up() error {
-	if r.unregNetMon == nil && r.netMon != nil {
-		r.unregNetMon = r.netMon.RegisterRuleDeleteCallback(r.onIPRuleDeleted)
-	}
 	if err := r.setNetfilterMode(netfilterOff); err != nil {
 		return fmt.Errorf("setting netfilter mode: %w", err)
 	}
@@ -333,6 +363,7 @@ func (r *linuxRouter) Close() error {
 	if r.unregNetMon != nil {
 		r.unregNetMon()
 	}
+	r.eventSubs.Close()
 	if err := r.downInterface(); err != nil {
 		return err
 	}
@@ -1276,7 +1307,6 @@ func (r *linuxRouter) justAddIPRules() error {
 	}
 	var errAcc error
 	for _, family := range r.addrFamilies() {
-
 		for _, ru := range ipRules() {
 			// Note: r is a value type here; safe to mutate it.
 			ru.Family = family.netlinkInt()

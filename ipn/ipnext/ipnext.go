@@ -37,7 +37,10 @@ type Extension interface {
 	// It must be the same as the name used to register the extension.
 	Name() string
 
-	// Init is called to initialize the extension when LocalBackend is initialized.
+	// Init is called to initialize the extension when LocalBackend's
+	// Start method is called. Extensions are created but not initialized
+	// unless LocalBackend is started.
+	//
 	// If the extension cannot be initialized, it must return an error,
 	// and its Shutdown method will not be called on the host's shutdown.
 	// Returned errors are not fatal; they are used for logging.
@@ -111,7 +114,7 @@ func RegisterExtension(name string, newExt NewExtensionFn) {
 		panic(fmt.Sprintf("ipnext: newExt is nil: %q", name))
 	}
 	if extensions.Contains(name) {
-		panic(fmt.Sprintf("ipnext: duplicate extensions: %q", name))
+		panic(fmt.Sprintf("ipnext: duplicate extension name %q", name))
 	}
 	extensions.Set(name, &Definition{name, newExt})
 }
@@ -333,6 +336,7 @@ type Hooks struct {
 	// BackendStateChange is called when the backend state changes.
 	BackendStateChange feature.Hooks[func(ipn.State)]
 
+	// ProfileStateChange contains callbacks that are invoked when the current login profile
 	// or its [ipn.Prefs] change, after those changes have been made. The current login profile
 	// may be changed either because of a profile switch, or because the profile information
 	// was updated by [LocalBackend.SetControlClientStatus], including when the profile
@@ -368,6 +372,10 @@ type Hooks struct {
 	// SetPeerStatus is called to mutate PeerStatus.
 	// Callers must only use NodeBackend to read data.
 	SetPeerStatus feature.Hooks[func(*ipnstate.PeerStatus, tailcfg.NodeView, NodeBackend)]
+
+	// ShouldUploadServices reports whether this node should include services
+	// in Hostinfo from the portlist extension.
+	ShouldUploadServices feature.Hook[func() bool]
 }
 
 // NodeBackend is an interface to query the current node and its peers.
@@ -394,4 +402,9 @@ type NodeBackend interface {
 	// It effectively just reports whether PeerAPIBase(node) is non-empty, but
 	// potentially more efficiently.
 	PeerHasPeerAPI(tailcfg.NodeView) bool
+
+	// CollectServices reports whether the control plane is telling this
+	// node that the portlist service collection is desirable, should it
+	// choose to report them.
+	CollectServices() bool
 }

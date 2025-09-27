@@ -40,8 +40,7 @@ import (
 	"github.com/tailscale/setec/client/setec"
 	"golang.org/x/time/rate"
 	"tailscale.com/atomicfile"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/metrics"
 	"tailscale.com/net/ktimeout"
 	"tailscale.com/net/stunserver"
@@ -68,7 +67,7 @@ var (
 	runDERP     = flag.Bool("derp", true, "whether to run a DERP server. The only reason to set this false is if you're decommissioning a server but want to keep its bootstrap DNS functionality still running.")
 	flagHome    = flag.String("home", "", "what to serve at the root path. It may be left empty (the default, for a default homepage), \"blank\" for a blank page, or a URL to redirect to")
 
-	meshPSKFile     = flag.String("mesh-psk-file", defaultMeshPSKFile(), "if non-empty, path to file containing the mesh pre-shared key file. It should contain some hex string; whitespace is trimmed.")
+	meshPSKFile     = flag.String("mesh-psk-file", defaultMeshPSKFile(), "if non-empty, path to file containing the mesh pre-shared key file. It must be 64 lowercase hexadecimal characters; whitespace is trimmed.")
 	meshWith        = flag.String("mesh-with", "", "optional comma-separated list of hostnames to mesh with; the server's own hostname can be in the list. If an entry contains a slash, the second part names a hostname to be used when dialing the target.")
 	secretsURL      = flag.String("secrets-url", "", "SETEC server URL for secrets retrieval of mesh key")
 	secretPrefix    = flag.String("secrets-path-prefix", "prod/derp", "setec path prefix for \""+setecMeshKeyName+"\" secret for DERP mesh key")
@@ -90,15 +89,15 @@ var (
 	// tcpUserTimeout is intentionally short, so that hung connections are cleaned up promptly. DERPs should be nearby users.
 	tcpUserTimeout = flag.Duration("tcp-user-timeout", 15*time.Second, "TCP user timeout")
 	// tcpWriteTimeout is the timeout for writing to client TCP connections. It does not apply to mesh connections.
-	tcpWriteTimeout = flag.Duration("tcp-write-timeout", derp.DefaultTCPWiteTimeout, "TCP write timeout; 0 results in no timeout being set on writes")
+	tcpWriteTimeout = flag.Duration("tcp-write-timeout", derpserver.DefaultTCPWiteTimeout, "TCP write timeout; 0 results in no timeout being set on writes")
+
+	// ACE
+	flagACEEnabled = flag.Bool("ace", false, "whether to enable embedded ACE server [experimental + in-development as of 2025-09-12; not yet documented]")
 )
 
 var (
 	tlsRequestVersion = &metrics.LabelMap{Label: "version"}
 	tlsActiveVersion  = &metrics.LabelMap{Label: "version"}
-
-	// Exactly 64 hexadecimal lowercase digits.
-	validMeshKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 const setecMeshKeyName = "meshkey"
@@ -159,14 +158,6 @@ func writeNewConfig() config {
 	return cfg
 }
 
-func checkMeshKey(key string) (string, error) {
-	key = strings.TrimSpace(key)
-	if !validMeshKey.MatchString(key) {
-		return "", errors.New("key must contain exactly 64 hex digits")
-	}
-	return key, nil
-}
-
 func main() {
 	flag.Parse()
 	if *versionFlag {
@@ -197,7 +188,7 @@ func main() {
 
 	serveTLS := tsweb.IsProd443(*addr) || *certMode == "manual"
 
-	s := derp.NewServer(cfg.PrivateKey, log.Printf)
+	s := derpserver.New(cfg.PrivateKey, log.Printf)
 	s.SetVerifyClient(*verifyClients)
 	s.SetTailscaledSocketPath(*socket)
 	s.SetVerifyClientURL(*verifyClientURL)
@@ -246,10 +237,9 @@ func main() {
 		log.Printf("No mesh key configured for --dev mode")
 	} else if meshKey == "" {
 		log.Printf("No mesh key configured")
-	} else if key, err := checkMeshKey(meshKey); err != nil {
+	} else if err := s.SetMeshKey(meshKey); err != nil {
 		log.Fatalf("invalid mesh key: %v", err)
 	} else {
-		s.SetMeshKey(key)
 		log.Println("DERP mesh key configured")
 	}
 
@@ -265,7 +255,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	if *runDERP {
-		derpHandler := derphttp.Handler(s)
+		derpHandler := derpserver.Handler(s)
 		derpHandler = addWebSocketSupport(s, derpHandler)
 		mux.Handle("/derp", derpHandler)
 	} else {
@@ -276,8 +266,8 @@ func main() {
 
 	// These two endpoints are the same. Different versions of the clients
 	// have assumes different paths over time so we support both.
-	mux.HandleFunc("/derp/probe", derphttp.ProbeHandler)
-	mux.HandleFunc("/derp/latency-check", derphttp.ProbeHandler)
+	mux.HandleFunc("/derp/probe", derpserver.ProbeHandler)
+	mux.HandleFunc("/derp/latency-check", derpserver.ProbeHandler)
 
 	go refreshBootstrapDNSLoop()
 	mux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS))
@@ -289,7 +279,7 @@ func main() {
 		tsweb.AddBrowserHeaders(w)
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
-	mux.Handle("/generate_204", http.HandlerFunc(derphttp.ServeNoContent))
+	mux.Handle("/generate_204", http.HandlerFunc(derpserver.ServeNoContent))
 	debug := tsweb.Debugger(mux)
 	debug.KV("TLS hostname", *hostname)
 	debug.KV("Mesh key", s.HasMeshKey())
@@ -385,6 +375,11 @@ func main() {
 				tlsRequestVersion.Add(label, 1)
 				tlsActiveVersion.Add(label, 1)
 				defer tlsActiveVersion.Add(label, -1)
+
+				if r.Method == "CONNECT" {
+					serveConnect(s, w, r)
+					return
+				}
 			}
 
 			mux.ServeHTTP(w, r)
@@ -392,7 +387,7 @@ func main() {
 		if *httpPort > -1 {
 			go func() {
 				port80mux := http.NewServeMux()
-				port80mux.HandleFunc("/generate_204", derphttp.ServeNoContent)
+				port80mux.HandleFunc("/generate_204", derpserver.ServeNoContent)
 				port80mux.Handle("/", certManager.HTTPHandler(tsweb.Port80Handler{Main: mux}))
 				port80srv := &http.Server{
 					Addr:        net.JoinHostPort(listenHost, fmt.Sprintf("%d", *httpPort)),

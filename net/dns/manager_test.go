@@ -4,6 +4,7 @@
 package dns
 
 import (
+	"errors"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -18,14 +19,16 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 type fakeOSConfigurator struct {
 	SplitDNS   bool
 	BaseConfig OSConfig
 
-	OSConfig       OSConfig
-	ResolverConfig resolver.Config
+	OSConfig         OSConfig
+	ResolverConfig   resolver.Config
+	GetBaseConfigErr *error
 }
 
 func (c *fakeOSConfigurator) SetDNS(cfg OSConfig) error {
@@ -45,6 +48,9 @@ func (c *fakeOSConfigurator) SupportsSplitDNS() bool {
 }
 
 func (c *fakeOSConfigurator) GetBaseConfig() (OSConfig, error) {
+	if c.GetBaseConfigErr != nil {
+		return OSConfig{}, *c.GetBaseConfigErr
+	}
 	return c.BaseConfig, nil
 }
 
@@ -927,7 +933,7 @@ func TestManager(t *testing.T) {
 				goos = "linux"
 			}
 			knobs := &controlknobs.Knobs{}
-			m := NewManager(t.Logf, &f, new(health.Tracker), tsdial.NewDialer(netmon.NewStatic()), nil, knobs, goos)
+			m := NewManager(t.Logf, &f, health.NewTracker(eventbustest.NewBus(t)), tsdial.NewDialer(netmon.NewStatic()), nil, knobs, goos)
 			m.resolver.TestOnlySetHook(f.SetResolver)
 
 			if err := m.Set(test.in); err != nil {
@@ -1018,4 +1024,51 @@ func upstreams(strs ...string) (ret map[dnsname.FQDN][]*dnstype.Resolver) {
 		}
 	}
 	return ret
+}
+
+func TestConfigRecompilation(t *testing.T) {
+	fakeErr := errors.New("fake os configurator error")
+	f := &fakeOSConfigurator{}
+	f.GetBaseConfigErr = &fakeErr
+	f.BaseConfig = OSConfig{
+		Nameservers: mustIPs("1.1.1.1"),
+	}
+
+	config := Config{
+		Routes:        upstreams("ts.net", "69.4.2.0", "foo.ts.net", ""),
+		SearchDomains: fqdns("foo.ts.net"),
+	}
+
+	m := NewManager(t.Logf, f, health.NewTracker(eventbustest.NewBus(t)), tsdial.NewDialer(netmon.NewStatic()), nil, nil, "darwin")
+
+	var managerConfig *resolver.Config
+	m.resolver.TestOnlySetHook(func(cfg resolver.Config) {
+		managerConfig = &cfg
+	})
+
+	// Initial set should error out and store the config
+	if err := m.Set(config); err == nil {
+		t.Fatalf("Want non-nil error.  Got nil")
+	}
+	if m.config == nil {
+		t.Fatalf("Want persisted config.  Got nil.")
+	}
+	if managerConfig != nil {
+		t.Fatalf("Want nil managerConfig.  Got %v", managerConfig)
+	}
+
+	// Clear the error.  We should take the happy path now and
+	// set m.manager's Config.
+	f.GetBaseConfigErr = nil
+
+	// Recompilation without an error should succeed and set m.config and m.manager's [resolver.Config]
+	if err := m.RecompileDNSConfig(); err != nil {
+		t.Fatalf("Want nil error.  Got err %v", err)
+	}
+	if m.config == nil {
+		t.Fatalf("Want non-nil config.  Got nil")
+	}
+	if managerConfig == nil {
+		t.Fatalf("Want non nil managerConfig.  Got nil")
+	}
 }

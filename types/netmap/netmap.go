@@ -54,12 +54,12 @@ type NetworkMap struct {
 	// between updates and should not be modified.
 	DERPMap *tailcfg.DERPMap
 
-	// ControlHealth are the list of health check problems for this
+	// DisplayMessages are the list of health check problems for this
 	// node from the perspective of the control plane.
 	// If empty, there are no known problems from the control plane's
 	// point of view, but the node might know about its own health
 	// check problems.
-	ControlHealth []string
+	DisplayMessages map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
 
 	// TKAEnabled indicates whether the tailnet key authority should be
 	// enabled, from the perspective of the control plane.
@@ -250,6 +250,22 @@ func (nm *NetworkMap) DomainName() string {
 		return ""
 	}
 	return nm.Domain
+}
+
+// TailnetDisplayName returns the admin-editable name contained in
+// NodeAttrTailnetDisplayName. If the capability is not present it
+// returns an empty string.
+func (nm *NetworkMap) TailnetDisplayName() string {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	tailnetDisplayNames, err := tailcfg.UnmarshalNodeCapViewJSON[string](nm.SelfNode.CapMap(), tailcfg.NodeAttrTailnetDisplayName)
+	if err != nil || len(tailnetDisplayNames) == 0 {
+		return ""
+	}
+
+	return tailnetDisplayNames[0]
 }
 
 // HasSelfCapability reports whether nm.SelfNode contains capability c.

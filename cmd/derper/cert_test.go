@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -131,15 +131,16 @@ func TestPinnedCertRawIP(t *testing.T) {
 	}
 	defer ln.Close()
 
-	ds := derp.NewServer(key.NewNode(), t.Logf)
+	ds := derpserver.New(key.NewNode(), t.Logf)
 
-	derpHandler := derphttp.Handler(ds)
+	derpHandler := derpserver.Handler(ds)
 	mux := http.NewServeMux()
 	mux.Handle("/derp", derpHandler)
 
 	var hs http.Server
 	hs.Handler = mux
 	hs.TLSConfig = cp.TLSConfig()
+	ds.ModifyTLSConfigToAddMetaCert(hs.TLSConfig)
 	go hs.ServeTLS(ln, "", "")
 
 	lnPort := ln.Addr().(*net.TCPAddr).Port
